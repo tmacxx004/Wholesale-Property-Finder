@@ -2,27 +2,24 @@ import re
 import csv
 import json
 import time
-import argparse
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Callable
+from urllib.parse import urlparse, urljoin
 
 import requests
 import pandas as pd
-from dateutil import parser as dateparser
 from rapidfuzz import fuzz
-
+from dateutil import parser as dateparser
 
 # =========================
-# Config
+# Global Config
 # =========================
 
-USER_AGENT = "HennepinMplsDealCrawler/1.0 (+public data; polite)"
-PAGE_SIZE = 2000  # ArcGIS layers often cap around this per page
+USER_AGENT = "HennepinMplsDealCrawler/1.1 (+public data; polite)"
+PAGE_SIZE = 2000
 
-# ---- Hennepin (ArcGIS REST) ----
-# This is the same dataset family described by Hennepin GIS Hub "County Parcels" and metadata containing
-# FORFEIT_LAND_IND and EARLIEST_DELQ_YR definitions.  :contentReference[oaicite:5]{index=5}
+# Hennepin ArcGIS REST query endpoint
 HENNEPIN_LAYER_QUERY_URL = (
     "https://gis.hennepin.us/arcgis/rest/services/HennepinData/LAND_PROPERTY/MapServer/1/query"
 )
@@ -45,18 +42,28 @@ HENNEPIN_FIELDS = [
     "FORFEIT_LAND_IND",
 ]
 
-# ---- Minneapolis Tableau dashboards (public pages) ----
-# Dashboard landing pages:
-# Vacant/Condemned: :contentReference[oaicite:6]{index=6}
-# Regulatory Violations: :contentReference[oaicite:7]{index=7}
-# Direct Tableau views discovered:
-MPLS_VBR_VIEW_URL = "https://tableau.minneapolismn.gov/views/MinneapolisVacantCondemnedPropertyInventory/DailyVBRcondemnedpropertylist"
-MPLS_VIOL_VIEW_URL = "https://tableau.minneapolismn.gov/views/OpenDataRegulatoryServices-Violations/ViolationDetails"
+# Tableau view URLs (friendly flags)
+MPLS_VBR_VIEW_URL = (
+    "https://tableau.minneapolismn.gov/views/"
+    "MinneapolisVacantCondemnedPropertyInventory/DailyVBRcondemnedpropertylist"
+    "?:showVizHome=no&:embed=y&:toolbar=n"
+)
+MPLS_VIOL_VIEW_URL = (
+    "https://tableau.minneapolismn.gov/views/"
+    "OpenDataRegulatoryServices-Violations/ViolationDetails"
+    "?:showVizHome=no&:embed=y&:toolbar=n"
+)
 
 
 # =========================
 # Helpers
 # =========================
+
+Logger = Optional[Callable[[str], None]]
+
+def log_msg(logger: Logger, msg: str):
+    if logger:
+        logger(msg)
 
 def polite_sleep(sec: float = 0.25):
     time.sleep(sec)
@@ -69,10 +76,10 @@ def normalize_ws(s: str) -> str:
 
 def normalize_addr(a: str) -> str:
     a = normalize_ws(a).upper()
-    # very basic normalization (enough for 80/20 matching)
     a = a.replace(".", "").replace(",", "").replace("#", " ")
     a = a.replace(" STREET", " ST").replace(" AVENUE", " AVE").replace(" ROAD", " RD")
     a = a.replace(" DRIVE", " DR").replace(" LANE", " LN").replace(" BOULEVARD", " BLVD")
+    a = a.replace(" PLACE", " PL").replace(" COURT", " CT")
     a = re.sub(r"\s+", " ", a).strip()
     return a
 
@@ -121,7 +128,7 @@ def parse_date_maybe(x: Any) -> Optional[str]:
 
 
 # =========================
-# Data models
+# Data model
 # =========================
 
 @dataclass
@@ -158,7 +165,7 @@ class ParcelLead:
 
 
 # =========================
-# ArcGIS Client (Hennepin)
+# Hennepin ArcGIS Client
 # =========================
 
 class ArcGISClient:
@@ -179,7 +186,7 @@ class ArcGISClient:
         r.raise_for_status()
         return r.json()
 
-def iter_hennepin_features(where: str, out_fields: List[str]) -> List[Dict[str, Any]]:
+def iter_hennepin_features(where: str, out_fields: List[str], logger: Logger = None) -> List[Dict[str, Any]]:
     client = ArcGISClient()
     feats_all = []
     offset = 0
@@ -187,6 +194,7 @@ def iter_hennepin_features(where: str, out_fields: List[str]) -> List[Dict[str, 
         data = client.query(where=where, out_fields=out_fields, offset=offset, count=PAGE_SIZE)
         feats = data.get("features") or []
         feats_all.extend(feats)
+        log_msg(logger, f"Hennepin: fetched {len(feats)} features (offset={offset}). Total={len(feats_all)}")
         if len(feats) < PAGE_SIZE:
             break
         offset += PAGE_SIZE
@@ -195,174 +203,298 @@ def iter_hennepin_features(where: str, out_fields: List[str]) -> List[Dict[str, 
 
 
 # =========================
-# Tableau extraction (Minneapolis)
+# Tableau Extraction (Fixed)
 # =========================
 
 class TableauExtractor:
     """
-    Tries two strategies:
-      1) Simple CSV export endpoints (fast if enabled)
-      2) BootstrapSession method (works on many Tableau servers)
-
-    If strategy 1 fails, strategy 2 usually works.
+    Robust extractor:
+      - Try .csv export first
+      - Fallback to vizql bootstrapSession:
+          1) GET view HTML
+          2) Extract correct /vizql/w/.../v/.../bootstrapSession/sessions/ path
+          3) POST to that endpoint
+          4) Parse JSON payload for dataSegments
     """
-    def __init__(self):
+    def __init__(self, logger: Logger = None):
+        self.logger = logger
         self.s = requests.Session()
         self.s.headers.update({"User-Agent": USER_AGENT})
 
     def try_simple_csv(self, view_url: str) -> Optional[pd.DataFrame]:
-        """
-        Many Tableau servers allow: /views/WB/Sheet.csv?:showVizHome=no
-        """
-        csv_url = view_url + ".csv"
-        params = {":showVizHome": "no"}
-        r = self.s.get(csv_url, params=params, timeout=60)
-        if r.status_code != 200 or "text/csv" not in (r.headers.get("Content-Type") or ""):
-            return None
-        from io import StringIO
-        return pd.read_csv(StringIO(r.text))
+        # Convert https://.../views/WB/Sheet?:... into https://.../views/WB/Sheet.csv?:showVizHome=no
+        base = view_url.split("?")[0]
+        csv_url = base + ".csv"
+        r = self.s.get(csv_url, params={":showVizHome": "no"}, timeout=60, allow_redirects=True)
+        ct = (r.headers.get("Content-Type") or "").lower()
+
+        if r.status_code == 200 and ("text/csv" in ct or r.text[:200].count(",") > 5):
+            from io import StringIO
+            df = pd.read_csv(StringIO(r.text))
+            log_msg(self.logger, f"Tableau CSV export succeeded: {base} (rows={len(df)})")
+            return df
+
+        log_msg(self.logger, f"Tableau CSV export not available (status={r.status_code}, ct={ct})")
+        return None
 
     def bootstrap_df(self, view_url: str) -> pd.DataFrame:
-        """
-        Bootstrap session technique:
-        - GET the viz page to capture a hidden bootstrap session endpoint
-        - POST/GET to bootstrapSession to retrieve data segments
-        - Parse the 'presModel' chunks to extract tables
-
-        NOTE: Tableau internal formats vary; we implement a practical extraction that works often,
-        but may require small tweaks if Minneapolis changes workbook structure.
-        """
-        # Step 1: request the viz page (no viz home)
-        r = self.s.get(view_url, params={":showVizHome": "no"}, timeout=60)
+        r = self.s.get(view_url, timeout=60, allow_redirects=True)
         r.raise_for_status()
         html = r.text
 
-        # Find bootstrapSession endpoint pieces (common patterns)
-        # Example pattern in HTML: bootstrapSession/sessions/{id}
-        m = re.search(r'"sessionid":"([^"]+)"', html, re.IGNORECASE)
+        # Find vizql bootstrap path
+        m = re.search(r'(/vizql/w/[^/]+/v/[^/]+/bootstrapSession/sessions/)', html)
         if not m:
-            # Alternate pattern: /bootstrapSession/sessions/
-            m2 = re.search(r'(bootstrapSession/sessions/)', html)
-            if not m2:
-                raise RuntimeError("Could not locate Tableau session info in HTML. Workbook may require auth or JS-only.")
+            m = re.search(r'(/vizql/w/[^"]+?/bootstrapSession/sessions/)', html)
+        if not m:
+            raise RuntimeError("Could not find Tableau vizql bootstrapSession endpoint in HTML.")
 
-        # Tableau often provides a 'sheetId' etc; easier approach:
-        # Use the documented-ish endpoint:
-        #   {view_url}/bootstrapSession/sessions/  (POST)
-        # with form data: sheet_id, showParams...
-        # We'll do a minimal POST known to work on many servers.
-        bootstrap_url = view_url + "/bootstrapSession/sessions/"
+        vizql_path = m.group(1)
+        parsed = urlparse(view_url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        bootstrap_url = urljoin(base, vizql_path)
+
+        log_msg(self.logger, f"Tableau bootstrap endpoint: {bootstrap_url}")
+
         payload = {
             "worksheetPortSize": '{"w":1200,"h":800}',
             "dashboardPortSize": '{"w":1200,"h":800}',
             "clientDimension": '{"w":1200,"h":800}',
             ":showVizHome": "no",
+            ":embed": "y",
         }
-        br = self.s.post(bootstrap_url, data=payload, timeout=60)
+
+        headers = {
+            "Referer": view_url,
+            "Accept": "application/json,text/plain,*/*",
+        }
+
+        br = self.s.post(bootstrap_url, data=payload, headers=headers, timeout=60, allow_redirects=True)
+        log_msg(self.logger, f"Tableau bootstrap status={br.status_code} url={br.url}")
         br.raise_for_status()
+
         txt = br.text
 
-        # The response contains a big JSON-ish blob with a "presModel" section.
-        # We'll extract any CSV-like data tables embedded in the response.
-        # Practical strategy: locate "dataSegments" and decode tables.
-        # This is not a full Tableau parser; it’s an 80/20 extractor.
-
-        # Find the presModel JSON chunk
-        idx = txt.find('"presModel"')
-        if idx == -1:
-            raise RuntimeError("Bootstrap response missing presModel; Tableau format changed or blocked.")
-
-        # Heuristic: find the largest JSON object in the response
-        # (Tableau responses sometimes have prefix; we find first '{' after presModel)
-        start = txt.rfind("{", 0, idx)
+        # Bootstrap response is often JSON-ish; extract largest JSON object
+        start = txt.find("{")
         end = txt.rfind("}")
-        blob = txt[start:end+1]
+        if start == -1 or end == -1:
+            raise RuntimeError("Unexpected Tableau bootstrap response format (no JSON object found).")
 
-        data = json.loads(blob)
+        data = json.loads(txt[start:end+1])
 
-        # Extract tables: navigate down to "presModel" -> "dataDictionary" / "dataSegments"
         pres = data.get("presModel", {})
         segments = pres.get("dataSegments") or {}
         if not segments:
-            raise RuntimeError("No dataSegments found in Tableau presModel (may require selecting a worksheet/table).")
+            raise RuntimeError("No dataSegments found in Tableau presModel.")
 
-        # Each segment is a columnar table; we’ll attempt to stitch the first large segment.
-        # This is intentionally simple; for production, you’d pick the segment by worksheet name.
+        # pick the segment with most columns
         best_key = None
-        best_size = 0
+        best_cols = 0
         for k, seg in segments.items():
-            # seg often contains "dataColumns"
             cols = seg.get("dataColumns") if isinstance(seg, dict) else None
-            if cols and len(cols) > best_size:
+            if cols and len(cols) > best_cols:
                 best_key = k
-                best_size = len(cols)
-
-        if not best_key:
-            raise RuntimeError("Could not identify a usable data segment to parse.")
+                best_cols = len(cols)
 
         seg = segments[best_key]
         cols = seg["dataColumns"]
 
-        # Tableau dataColumns: each col has "dataValues"
         table = {}
-        row_count = None
         for i, col in enumerate(cols):
             values = col.get("dataValues") or []
-            if row_count is None:
-                row_count = len(values)
             name = col.get("fieldCaption") or col.get("caption") or f"col_{i}"
             table[name] = values
 
         df = pd.DataFrame(table)
+        log_msg(self.logger, f"Tableau bootstrap parse OK (rows={len(df)}, cols={len(df.columns)})")
         return df
 
     def extract(self, view_url: str) -> pd.DataFrame:
         df = self.try_simple_csv(view_url)
         if df is not None and not df.empty:
             return df
-        # fallback
         return self.bootstrap_df(view_url)
 
 
+def fetch_mpls_tables(enable_mpls: bool, logger: Logger = None) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    if not enable_mpls:
+        return None, None
+
+    t = TableauExtractor(logger=logger)
+
+    vbr = None
+    viol = None
+
+    try:
+        log_msg(logger, "Fetching Minneapolis VBR (Vacant/Condemned)…")
+        vbr = t.extract(MPLS_VBR_VIEW_URL)
+    except Exception as e:
+        log_msg(logger, f"[WARN] VBR Tableau extract failed: {e}")
+
+    polite_sleep(0.5)
+
+    try:
+        log_msg(logger, "Fetching Minneapolis Violations…")
+        viol = t.extract(MPLS_VIOL_VIEW_URL)
+    except Exception as e:
+        log_msg(logger, f"[WARN] Violations Tableau extract failed: {e}")
+
+    return vbr, viol
+
+
 # =========================
-# Matching + stacking
+# Matching + Stacking
 # =========================
 
-def match_by_address(target_addr: str, target_city: str, df: pd.DataFrame,
-                     addr_col_candidates: List[str], city_col_candidates: List[str],
-                     min_score: int = 92) -> Optional[int]:
-    """
-    Returns row index match (best match) or None.
-    """
+def match_by_address(
+    target_addr: str,
+    target_city: str,
+    df: pd.DataFrame,
+    addr_col_candidates: List[str],
+    city_col_candidates: List[str],
+    min_score: int = 92
+) -> Optional[int]:
     t_addr = normalize_addr(target_addr)
     t_city = normalize_ws(target_city).upper()
 
-    addr_col = next((c for c in addr_col_candidates if c in df.columns), None)
-    city_col = next((c for c in city_col_candidates if c in df.columns), None)
+    addr_col = next((c for c in addr_col_candidates if c and c in df.columns), None)
+    city_col = next((c for c in city_col_candidates if c and c in df.columns), None)
     if not addr_col:
         return None
 
-    best = (None, 0)
+    best_idx = None
+    best_score = 0
+
     for idx, row in df.iterrows():
         r_addr = normalize_addr(str(row.get(addr_col) or ""))
         if not r_addr:
             continue
 
-        # quick city filter if available
         if city_col:
             r_city = normalize_ws(str(row.get(city_col) or "")).upper()
             if r_city and t_city and r_city != t_city:
                 continue
 
         sc = fuzz.token_sort_ratio(t_addr, r_addr)
-        if sc > best[1]:
-            best = (idx, sc)
+        if sc > best_score:
+            best_score = sc
+            best_idx = idx
 
-    return best[0] if best[0] is not None and best[1] >= min_score else None
+    if best_idx is not None and best_score >= min_score:
+        return best_idx
+    return None
 
 
-def score_lead(base: Dict[str, Any], mpls_vacant: bool, condemned_date: Optional[str],
-               violation_count: int, open_violation_count: int) -> Tuple[float, List[str]]:
+def infer_vbr_columns(df: pd.DataFrame) -> Dict[str, str]:
+    candidates = {
+        "address": ["Address", "ADDRESS", "Property Address", "PROPERTY ADDRESS"],
+        "condemned_date": ["Condemned Date", "CONDEMNED DATE", "Condemned", "CONDEMNED"],
+        "vbr_type": ["Type", "VBR Type", "Status", "VBR Status", "VBR_STATUS"],
+        "city": ["City", "CITY", "Municipality", "MUNIC_NM"],
+    }
+    resolved = {}
+    upper_map = {c.upper(): c for c in df.columns}
+    for key, opts in candidates.items():
+        for o in opts:
+            if o.upper() in upper_map:
+                resolved[key] = upper_map[o.upper()]
+                break
+    return resolved
+
+
+def infer_violation_columns(df: pd.DataFrame) -> Dict[str, str]:
+    candidates = {
+        "address": ["Address", "ADDRESS", "Property Address", "PROPERTY ADDRESS"],
+        "resolved": ["Violation Resolved?", "Resolved", "VIOLATION RESOLVED?", "RESOLVED"],
+        "city": ["City", "CITY", "Municipality", "MUNIC_NM"],
+    }
+    resolved = {}
+    upper_map = {c.upper(): c for c in df.columns}
+    for key, opts in candidates.items():
+        for o in opts:
+            if o.upper() in upper_map:
+                resolved[key] = upper_map[o.upper()]
+                break
+    return resolved
+
+
+def stack_mpls(
+    attrs: Dict[str, Any],
+    vbr_df: Optional[pd.DataFrame],
+    viol_df: Optional[pd.DataFrame],
+) -> Tuple[bool, Optional[str], Optional[str], int, int]:
+    situs_addr = build_situs_address(attrs)
+    city = normalize_ws(str(attrs.get("MUNIC_NM") or ""))
+
+    mpls_vacant = False
+    condemned_date = None
+    vbr_type = None
+    violation_count = 0
+    open_violation_count = 0
+
+    # VBR match
+    if vbr_df is not None and not vbr_df.empty:
+        cols = infer_vbr_columns(vbr_df)
+        idx = match_by_address(
+            target_addr=situs_addr,
+            target_city=city,
+            df=vbr_df,
+            addr_col_candidates=[cols.get("address"), "Address", "PROPERTY ADDRESS", "ADDRESS"],
+            city_col_candidates=[cols.get("city"), "City", "MUNIC_NM"],
+            min_score=92,
+        )
+        if idx is not None:
+            mpls_vacant = True
+            if cols.get("condemned_date"):
+                condemned_date = parse_date_maybe(vbr_df.loc[idx, cols["condemned_date"]])
+            if cols.get("vbr_type"):
+                vbr_type = normalize_ws(str(vbr_df.loc[idx, cols["vbr_type"]] or ""))
+
+    # Violations aggregation
+    if viol_df is not None and not viol_df.empty:
+        cols = infer_violation_columns(viol_df)
+        addr_col = cols.get("address") or ("Address" if "Address" in viol_df.columns else None)
+        resolved_col = cols.get("resolved")
+        city_col = cols.get("city")
+
+        if addr_col:
+            t_addr = normalize_addr(situs_addr)
+            t_city = normalize_ws(city).upper()
+
+            for _, row in viol_df.iterrows():
+                r_addr = normalize_addr(str(row.get(addr_col) or ""))
+                if not r_addr:
+                    continue
+
+                if city_col:
+                    r_city = normalize_ws(str(row.get(city_col) or "")).upper()
+                    if r_city and t_city and r_city != t_city:
+                        continue
+
+                if fuzz.token_sort_ratio(t_addr, r_addr) >= 92:
+                    violation_count += 1
+                    if resolved_col:
+                        resolved_val = str(row.get(resolved_col) or "").strip().upper()
+                        if resolved_val in ("NO", "N", "FALSE", "0", ""):
+                            open_violation_count += 1
+                    else:
+                        open_violation_count += 1
+
+    return mpls_vacant, condemned_date, vbr_type, violation_count, open_violation_count
+
+
+# =========================
+# Scoring
+# =========================
+
+def score_lead(
+    base: Dict[str, Any],
+    mpls_vacant: bool,
+    condemned_date: Optional[str],
+    violation_count: int,
+    open_violation_count: int
+) -> Tuple[float, List[str]]:
     score = 0.0
     notes = []
 
@@ -396,10 +528,10 @@ def score_lead(base: Dict[str, Any], mpls_vacant: bool, condemned_date: Optional
     # Minneapolis stacking boosts
     if mpls_vacant:
         score += 35
-        notes.append("Mpls vacant/condemned (VBR dashboard match)")
+        notes.append("Mpls vacant/condemned match")
     if condemned_date:
         score += 10
-        notes.append(f"Has condemned date ({condemned_date})")
+        notes.append(f"Condemned date ({condemned_date})")
 
     if open_violation_count >= 5:
         score += 25
@@ -416,129 +548,40 @@ def score_lead(base: Dict[str, Any], mpls_vacant: bool, condemned_date: Optional
 
 
 # =========================
-# Build pipeline
+# Filters + Runner
 # =========================
 
 def build_where_clause(cities: Optional[List[str]]) -> str:
     base = "(EARLIEST_DELQ_YR IS NOT NULL) OR (FORFEIT_LAND_IND = 'Y')"
     if not cities:
         return base
-    # ArcGIS SQL: MUNIC_NM IN (...)
     quoted = ",".join([f"'{c.upper()}'" for c in cities])
     return f"({base}) AND (UPPER(MUNIC_NM) IN ({quoted}))"
 
-def fetch_mpls_tables(enable_mpls: bool) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    if not enable_mpls:
-        return None, None
-    t = TableauExtractor()
-    # These workbook views come from the Tableau URLs discovered for Minneapolis. :contentReference[oaicite:8]{index=8}
-    vbr = t.extract(MPLS_VBR_VIEW_URL)
-    polite_sleep(0.5)
-    viol = t.extract(MPLS_VIOL_VIEW_URL)
-    return vbr, viol
 
-def infer_vbr_columns(df: pd.DataFrame) -> Dict[str, str]:
-    # Best-effort guessing; if Minneapolis changes labels, adjust here.
-    candidates = {
-        "address": ["Address", "ADDRESS", "Property Address", "PROPERTY ADDRESS"],
-        "condemned_date": ["Condemned Date", "CONDEMNED DATE", "CON1", "CONB", "Condemned"],
-        "vbr_type": ["Type", "VBR Type", "VBR_STATUS", "Status", "VBR Status"],
-        "city": ["City", "CITY", "Municipality", "MUNIC_NM"],
-    }
-    resolved = {}
-    for key, opts in candidates.items():
-        for c in df.columns:
-            if c in opts or c.upper() in [o.upper() for o in opts]:
-                resolved[key] = c
-                break
-    return resolved
-
-def infer_violation_columns(df: pd.DataFrame) -> Dict[str, str]:
-    candidates = {
-        "address": ["Address", "ADDRESS", "Property Address", "PROPERTY ADDRESS"],
-        "resolved": ["Violation Resolved?", "Resolved", "VIOLATION RESOLVED?", "RESOLVED"],
-        "city": ["City", "CITY", "Municipality", "MUNIC_NM"],
-    }
-    resolved = {}
-    for key, opts in candidates.items():
-        for c in df.columns:
-            if c in opts or c.upper() in [o.upper() for o in opts]:
-                resolved[key] = c
-                break
-    return resolved
-
-def stack_mpls(pid_row: Dict[str, Any],
-               vbr_df: Optional[pd.DataFrame],
-               viol_df: Optional[pd.DataFrame]) -> Tuple[bool, Optional[str], Optional[str], int, int]:
-    """
-    Returns:
-      (vacant_flag, condemned_date, vbr_type, violation_count, open_violation_count)
-    """
-    situs_addr = build_situs_address(pid_row)
-    city = normalize_ws(str(pid_row.get("MUNIC_NM") or ""))
-
-    mpls_vacant = False
-    condemned_date = None
-    vbr_type = None
-    violation_count = 0
-    open_violation_count = 0
-
-    # VBR match
-    if vbr_df is not None and not vbr_df.empty:
-        cols = infer_vbr_columns(vbr_df)
-        idx = match_by_address(
-            target_addr=situs_addr,
-            target_city=city,
-            df=vbr_df,
-            addr_col_candidates=[cols.get("address","Address"), "Address", "ADDRESS", "Property Address"],
-            city_col_candidates=[cols.get("city","City"), "City", "CITY"],
-            min_score=92
-        )
-        if idx is not None:
-            mpls_vacant = True
-            if "condemned_date" in cols:
-                condemned_date = parse_date_maybe(vbr_df.loc[idx, cols["condemned_date"]])
-            if "vbr_type" in cols:
-                vbr_type = normalize_ws(str(vbr_df.loc[idx, cols["vbr_type"]] or ""))
-
-    # Violations aggregation by address match
-    if viol_df is not None and not viol_df.empty:
-        cols = infer_violation_columns(viol_df)
-        addr_col = cols.get("address") or ("Address" if "Address" in viol_df.columns else None)
-        resolved_col = cols.get("resolved")
-        city_col = cols.get("city")
-
-        if addr_col:
-            t_addr = normalize_addr(situs_addr)
-            t_city = normalize_ws(city).upper()
-            for _, row in viol_df.iterrows():
-                r_addr = normalize_addr(str(row.get(addr_col) or ""))
-                if not r_addr:
-                    continue
-                if city_col:
-                    r_city = normalize_ws(str(row.get(city_col) or "")).upper()
-                    if r_city and t_city and r_city != t_city:
-                        continue
-                if fuzz.token_sort_ratio(t_addr, r_addr) >= 92:
-                    violation_count += 1
-                    if resolved_col:
-                        resolved_val = str(row.get(resolved_col) or "").strip().upper()
-                        if resolved_val in ("NO", "N", "FALSE", "0", ""):
-                            open_violation_count += 1
-                    else:
-                        # If no resolved column, treat as "open-ish" bucket
-                        open_violation_count += 1
-
-    return mpls_vacant, condemned_date, vbr_type, violation_count, open_violation_count
-
-def run(cities: Optional[List[str]], enable_mpls: bool, top_n: int, out_csv: str):
+def run(
+    cities: Optional[List[str]],
+    enable_mpls: bool,
+    top_n: int,
+    out_csv: str,
+    logger: Logger = None,
+):
     where = build_where_clause(cities)
-    feats = iter_hennepin_features(where=where, out_fields=HENNEPIN_FIELDS)
+    log_msg(logger, f"WHERE clause: {where}")
 
-    vbr_df, viol_df = fetch_mpls_tables(enable_mpls=enable_mpls)
+    feats = iter_hennepin_features(where=where, out_fields=HENNEPIN_FIELDS, logger=logger)
+
+    vbr_df, viol_df = fetch_mpls_tables(enable_mpls=enable_mpls, logger=logger)
+
+    if enable_mpls:
+        if vbr_df is None:
+            log_msg(logger, "[WARN] Minneapolis VBR data unavailable. Continuing without VBR stacking.")
+        if viol_df is None:
+            log_msg(logger, "[WARN] Minneapolis Violations data unavailable. Continuing without violations stacking.")
 
     leads: List[ParcelLead] = []
-    for f in feats:
+
+    for i, f in enumerate(feats):
         attrs = f.get("attributes") or {}
         pid = str(attrs.get("PID") or "").strip()
         if not pid:
@@ -554,7 +597,10 @@ def run(cities: Optional[List[str]], enable_mpls: bool, top_n: int, out_csv: str
         forfeited = (str(attrs.get("FORFEIT_LAND_IND") or "").upper() == "Y")
         absentee = is_absentee(attrs)
 
-        mpls_vacant, condemned_date, vbr_type, vio_cnt, open_vio_cnt = stack_mpls(attrs, vbr_df, viol_df) if enable_mpls else (False, None, None, 0, 0)
+        if enable_mpls and (vbr_df is not None or viol_df is not None):
+            mpls_vacant, condemned_date, vbr_type, vio_cnt, open_vio_cnt = stack_mpls(attrs, vbr_df, viol_df)
+        else:
+            mpls_vacant, condemned_date, vbr_type, vio_cnt, open_vio_cnt = (False, None, None, 0, 0)
 
         score, notes = score_lead(attrs, mpls_vacant, condemned_date, vio_cnt, open_vio_cnt)
 
@@ -583,32 +629,24 @@ def run(cities: Optional[List[str]], enable_mpls: bool, top_n: int, out_csv: str
             score_notes="; ".join(notes),
         ))
 
+        if i % 2000 == 0 and i > 0:
+            log_msg(logger, f"Processed {i} parcels…")
+        polite_sleep(0.001)
+
     leads.sort(key=lambda x: x.score, reverse=True)
     rows = [asdict(l) for l in leads[:top_n]]
 
+    if not rows:
+        # still write empty with headers for consistency
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["pid"])
+        log_msg(logger, "No rows returned. Wrote empty CSV.")
+        return
+
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["pid"])
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
 
-    print(f"Exported {len(rows)} leads -> {out_csv}")
-
-
-# =========================
-# CLI
-# =========================
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--cities", nargs="*", help="City/suburb filter (match Hennepin MUNIC_NM). Example: Minneapolis Bloomington")
-    ap.add_argument("--enable-mpls", action="store_true", help="Stack Minneapolis VBR + Violations (Tableau)")
-    ap.add_argument("--top", type=int, default=1000, help="Top N to export")
-    ap.add_argument("--out", default="ranked_leads_hennepin_mpls.csv", help="Output CSV path")
-    args = ap.parse_args()
-
-    run(
-        cities=args.cities,
-        enable_mpls=args.enable_mpls,
-        top_n=args.top,
-        out_csv=args.out
-    )
+    log_msg(logger, f"Exported {len(rows)} rows -> {out_csv}")
