@@ -16,10 +16,9 @@ from dateutil import parser as dateparser
 # Global Config
 # =========================
 
-USER_AGENT = "HennepinMplsDealCrawler/1.1 (+public data; polite)"
+USER_AGENT = "HennepinMplsDealCrawler/1.2 (+public data; polite)"
 PAGE_SIZE = 2000
 
-# Hennepin ArcGIS REST query endpoint
 HENNEPIN_LAYER_QUERY_URL = (
     "https://gis.hennepin.us/arcgis/rest/services/HennepinData/LAND_PROPERTY/MapServer/1/query"
 )
@@ -42,7 +41,8 @@ HENNEPIN_FIELDS = [
     "FORFEIT_LAND_IND",
 ]
 
-# Tableau view URLs (friendly flags)
+# Geometry fields are returned separately; we keep attributes list same.
+
 MPLS_VBR_VIEW_URL = (
     "https://tableau.minneapolismn.gov/views/"
     "MinneapolisVacantCondemnedPropertyInventory/DailyVBRcondemnedpropertylist"
@@ -53,11 +53,6 @@ MPLS_VIOL_VIEW_URL = (
     "OpenDataRegulatoryServices-Violations/ViolationDetails"
     "?:showVizHome=no&:embed=y&:toolbar=n"
 )
-
-
-# =========================
-# Helpers
-# =========================
 
 Logger = Optional[Callable[[str], None]]
 
@@ -126,6 +121,19 @@ def parse_date_maybe(x: Any) -> Optional[str]:
     except Exception:
         return None
 
+# =========================
+# County property page link
+# =========================
+
+def hennepin_pins_pid_url(pid: str) -> str:
+    """
+    Hennepin Property Information Search (PINS).
+    This site discourages scraping; we only link out. :contentReference[oaicite:4]{index=4}
+    """
+    pid = (pid or "").strip()
+    # This is the official PID search entry point.
+    # Adding pid=... may or may not prefill; user can paste PID if needed.
+    return f"https://www16.co.hennepin.mn.us/pins/?articleId=by_pid&pid={pid}"
 
 # =========================
 # Data model
@@ -152,7 +160,6 @@ class ParcelLead:
     forfeited: bool
     absentee: bool
 
-    # Minneapolis stack fields
     mpls_vacant_condemned: bool
     mpls_condemned_date: Optional[str]
     mpls_vbr_type: Optional[str]
@@ -163,9 +170,8 @@ class ParcelLead:
     score: float
     score_notes: str
 
-
 # =========================
-# Hennepin ArcGIS Client
+# ArcGIS client
 # =========================
 
 class ArcGISClient:
@@ -173,15 +179,7 @@ class ArcGISClient:
         self.s = requests.Session()
         self.s.headers.update({"User-Agent": USER_AGENT})
 
-    def query(self, where: str, out_fields: List[str], offset: int, count: int) -> Dict[str, Any]:
-        params = {
-            "where": where,
-            "outFields": ",".join(out_fields),
-            "f": "json",
-            "resultOffset": offset,
-            "resultRecordCount": count,
-            "returnGeometry": "false",
-        }
+    def query(self, params: Dict[str, Any]) -> Dict[str, Any]:
         r = self.s.get(HENNEPIN_LAYER_QUERY_URL, params=params, timeout=60)
         r.raise_for_status()
         return r.json()
@@ -191,7 +189,15 @@ def iter_hennepin_features(where: str, out_fields: List[str], logger: Logger = N
     feats_all = []
     offset = 0
     while True:
-        data = client.query(where=where, out_fields=out_fields, offset=offset, count=PAGE_SIZE)
+        params = {
+            "where": where,
+            "outFields": ",".join(out_fields),
+            "f": "json",
+            "resultOffset": offset,
+            "resultRecordCount": PAGE_SIZE,
+            "returnGeometry": "false",
+        }
+        data = client.query(params)
         feats = data.get("features") or []
         feats_all.extend(feats)
         log_msg(logger, f"Hennepin: fetched {len(feats)} features (offset={offset}). Total={len(feats_all)}")
@@ -201,28 +207,17 @@ def iter_hennepin_features(where: str, out_fields: List[str], logger: Logger = N
         polite_sleep(0.2)
     return feats_all
 
-
 # =========================
-# Tableau Extraction (Fixed)
+# Tableau extraction (same fixed version as before)
 # =========================
 
 class TableauExtractor:
-    """
-    Robust extractor:
-      - Try .csv export first
-      - Fallback to vizql bootstrapSession:
-          1) GET view HTML
-          2) Extract correct /vizql/w/.../v/.../bootstrapSession/sessions/ path
-          3) POST to that endpoint
-          4) Parse JSON payload for dataSegments
-    """
     def __init__(self, logger: Logger = None):
         self.logger = logger
         self.s = requests.Session()
         self.s.headers.update({"User-Agent": USER_AGENT})
 
     def try_simple_csv(self, view_url: str) -> Optional[pd.DataFrame]:
-        # Convert https://.../views/WB/Sheet?:... into https://.../views/WB/Sheet.csv?:showVizHome=no
         base = view_url.split("?")[0]
         csv_url = base + ".csv"
         r = self.s.get(csv_url, params={":showVizHome": "no"}, timeout=60, allow_redirects=True)
@@ -242,7 +237,6 @@ class TableauExtractor:
         r.raise_for_status()
         html = r.text
 
-        # Find vizql bootstrap path
         m = re.search(r'(/vizql/w/[^/]+/v/[^/]+/bootstrapSession/sessions/)', html)
         if not m:
             m = re.search(r'(/vizql/w/[^"]+?/bootstrapSession/sessions/)', html)
@@ -264,31 +258,23 @@ class TableauExtractor:
             ":embed": "y",
         }
 
-        headers = {
-            "Referer": view_url,
-            "Accept": "application/json,text/plain,*/*",
-        }
-
+        headers = {"Referer": view_url, "Accept": "application/json,text/plain,*/*"}
         br = self.s.post(bootstrap_url, data=payload, headers=headers, timeout=60, allow_redirects=True)
         log_msg(self.logger, f"Tableau bootstrap status={br.status_code} url={br.url}")
         br.raise_for_status()
 
         txt = br.text
-
-        # Bootstrap response is often JSON-ish; extract largest JSON object
         start = txt.find("{")
         end = txt.rfind("}")
         if start == -1 or end == -1:
             raise RuntimeError("Unexpected Tableau bootstrap response format (no JSON object found).")
 
         data = json.loads(txt[start:end+1])
-
         pres = data.get("presModel", {})
         segments = pres.get("dataSegments") or {}
         if not segments:
             raise RuntimeError("No dataSegments found in Tableau presModel.")
 
-        # pick the segment with most columns
         best_key = None
         best_cols = 0
         for k, seg in segments.items():
@@ -316,18 +302,16 @@ class TableauExtractor:
             return df
         return self.bootstrap_df(view_url)
 
-
 def fetch_mpls_tables(enable_mpls: bool, logger: Logger = None) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     if not enable_mpls:
         return None, None
 
     t = TableauExtractor(logger=logger)
-
     vbr = None
     viol = None
 
     try:
-        log_msg(logger, "Fetching Minneapolis VBR (Vacant/Condemned)…")
+        log_msg(logger, "Fetching Minneapolis VBR…")
         vbr = t.extract(MPLS_VBR_VIEW_URL)
     except Exception as e:
         log_msg(logger, f"[WARN] VBR Tableau extract failed: {e}")
@@ -342,9 +326,8 @@ def fetch_mpls_tables(enable_mpls: bool, logger: Logger = None) -> Tuple[Optiona
 
     return vbr, viol
 
-
 # =========================
-# Matching + Stacking
+# Matching/stacking helpers (same as before)
 # =========================
 
 def match_by_address(
@@ -385,7 +368,6 @@ def match_by_address(
         return best_idx
     return None
 
-
 def infer_vbr_columns(df: pd.DataFrame) -> Dict[str, str]:
     candidates = {
         "address": ["Address", "ADDRESS", "Property Address", "PROPERTY ADDRESS"],
@@ -402,7 +384,6 @@ def infer_vbr_columns(df: pd.DataFrame) -> Dict[str, str]:
                 break
     return resolved
 
-
 def infer_violation_columns(df: pd.DataFrame) -> Dict[str, str]:
     candidates = {
         "address": ["Address", "ADDRESS", "Property Address", "PROPERTY ADDRESS"],
@@ -418,7 +399,6 @@ def infer_violation_columns(df: pd.DataFrame) -> Dict[str, str]:
                 break
     return resolved
 
-
 def stack_mpls(
     attrs: Dict[str, Any],
     vbr_df: Optional[pd.DataFrame],
@@ -433,7 +413,6 @@ def stack_mpls(
     violation_count = 0
     open_violation_count = 0
 
-    # VBR match
     if vbr_df is not None and not vbr_df.empty:
         cols = infer_vbr_columns(vbr_df)
         idx = match_by_address(
@@ -451,7 +430,6 @@ def stack_mpls(
             if cols.get("vbr_type"):
                 vbr_type = normalize_ws(str(vbr_df.loc[idx, cols["vbr_type"]] or ""))
 
-    # Violations aggregation
     if viol_df is not None and not viol_df.empty:
         cols = infer_violation_columns(viol_df)
         addr_col = cols.get("address") or ("Address" if "Address" in viol_df.columns else None)
@@ -482,7 +460,6 @@ def stack_mpls(
                         open_violation_count += 1
 
     return mpls_vacant, condemned_date, vbr_type, violation_count, open_violation_count
-
 
 # =========================
 # Scoring
@@ -525,7 +502,6 @@ def score_lead(
         score += 10
         notes.append(f"Non-homestead code ({hmstd})")
 
-    # Minneapolis stacking boosts
     if mpls_vacant:
         score += 35
         notes.append("Mpls vacant/condemned match")
@@ -546,9 +522,8 @@ def score_lead(
 
     return score, notes
 
-
 # =========================
-# Filters + Runner
+# Main runner (writes CSV)
 # =========================
 
 def build_where_clause(cities: Optional[List[str]]) -> str:
@@ -557,7 +532,6 @@ def build_where_clause(cities: Optional[List[str]]) -> str:
         return base
     quoted = ",".join([f"'{c.upper()}'" for c in cities])
     return f"({base}) AND (UPPER(MUNIC_NM) IN ({quoted}))"
-
 
 def run(
     cities: Optional[List[str]],
@@ -570,32 +544,25 @@ def run(
     log_msg(logger, f"WHERE clause: {where}")
 
     feats = iter_hennepin_features(where=where, out_fields=HENNEPIN_FIELDS, logger=logger)
-
     vbr_df, viol_df = fetch_mpls_tables(enable_mpls=enable_mpls, logger=logger)
 
     if enable_mpls:
         if vbr_df is None:
-            log_msg(logger, "[WARN] Minneapolis VBR data unavailable. Continuing without VBR stacking.")
+            log_msg(logger, "[WARN] Minneapolis VBR unavailable. Continuing without VBR stacking.")
         if viol_df is None:
-            log_msg(logger, "[WARN] Minneapolis Violations data unavailable. Continuing without violations stacking.")
+            log_msg(logger, "[WARN] Minneapolis Violations unavailable. Continuing without violations stacking.")
 
     leads: List[ParcelLead] = []
 
-    for i, f in enumerate(feats):
+    for f in feats:
         attrs = f.get("attributes") or {}
         pid = str(attrs.get("PID") or "").strip()
         if not pid:
             continue
 
-        situs_addr = build_situs_address(attrs)
-        situs_city = normalize_ws(str(attrs.get("MUNIC_NM") or ""))
-        situs_zip = normalize_ws(str(attrs.get("ZIP_CD") or ""))
-        owner = normalize_ws(str(attrs.get("OWNER_NM") or ""))
-
         delq_year = parse_2digit_year(attrs.get("EARLIEST_DELQ_YR"))
         yrs_delq = (now_year() - delq_year) if delq_year else None
         forfeited = (str(attrs.get("FORFEIT_LAND_IND") or "").upper() == "Y")
-        absentee = is_absentee(attrs)
 
         if enable_mpls and (vbr_df is not None or viol_df is not None):
             mpls_vacant, condemned_date, vbr_type, vio_cnt, open_vio_cnt = stack_mpls(attrs, vbr_df, viol_df)
@@ -606,10 +573,10 @@ def run(
 
         leads.append(ParcelLead(
             pid=pid,
-            owner_name=owner,
-            situs_address=situs_addr,
-            situs_city=situs_city,
-            situs_zip=situs_zip,
+            owner_name=normalize_ws(str(attrs.get("OWNER_NM") or "")),
+            situs_address=build_situs_address(attrs),
+            situs_city=normalize_ws(str(attrs.get("MUNIC_NM") or "")),
+            situs_zip=normalize_ws(str(attrs.get("ZIP_CD") or "")),
             mailing_city=normalize_ws(str(attrs.get("MAILING_MUNIC_NM") or "")),
             property_type=normalize_ws(str(attrs.get("PR_TYP_NM1") or "")),
             homestead_code=normalize_ws(str(attrs.get("HMSTD_CD1") or "")),
@@ -619,7 +586,7 @@ def run(
             earliest_delq_year=delq_year,
             years_delinquent=yrs_delq,
             forfeited=forfeited,
-            absentee=absentee,
+            absentee=is_absentee(attrs),
             mpls_vacant_condemned=mpls_vacant,
             mpls_condemned_date=condemned_date,
             mpls_vbr_type=vbr_type,
@@ -629,19 +596,12 @@ def run(
             score_notes="; ".join(notes),
         ))
 
-        if i % 2000 == 0 and i > 0:
-            log_msg(logger, f"Processed {i} parcels…")
-        polite_sleep(0.001)
-
     leads.sort(key=lambda x: x.score, reverse=True)
     rows = [asdict(l) for l in leads[:top_n]]
 
     if not rows:
-        # still write empty with headers for consistency
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["pid"])
-        log_msg(logger, "No rows returned. Wrote empty CSV.")
+            csv.writer(f).writerow(["pid"])
         return
 
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
@@ -650,3 +610,178 @@ def run(
         w.writerows(rows)
 
     log_msg(logger, f"Exported {len(rows)} rows -> {out_csv}")
+
+# =========================
+# Comparable analysis helpers (NEW)
+# =========================
+
+def _polygon_centroid(rings: List[List[List[float]]]) -> Optional[Tuple[float, float]]:
+    """
+    Very lightweight centroid for polygon rings (Web Mercator or WGS84).
+    We approximate centroid using standard polygon centroid on the first ring.
+    """
+    if not rings or not rings[0]:
+        return None
+    pts = rings[0]
+    if len(pts) < 3:
+        return None
+
+    area = 0.0
+    cx = 0.0
+    cy = 0.0
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i][0], pts[i][1]
+        x1, y1 = pts[i+1][0], pts[i+1][1]
+        cross = x0 * y1 - x1 * y0
+        area += cross
+        cx += (x0 + x1) * cross
+        cy += (y0 + y1) * cross
+
+    area *= 0.5
+    if abs(area) < 1e-9:
+        # fallback: average points
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+    cx /= (6.0 * area)
+    cy /= (6.0 * area)
+    return (cx, cy)
+
+def _arcgis_query(params: Dict[str, Any]) -> Dict[str, Any]:
+    s = requests.Session()
+    s.headers.update({"User-Agent": USER_AGENT})
+    r = s.get(HENNEPIN_LAYER_QUERY_URL, params=params, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+def get_parcel_by_pid(pid: str) -> Optional[Dict[str, Any]]:
+    """
+    Pull a single parcel record by PID (from ArcGIS parcel layer).
+    Returns normalized dict used by the comps page.
+    """
+    pid = (pid or "").strip()
+    if not pid:
+        return None
+
+    params = {
+        "where": f"PID = '{pid}'",
+        "outFields": ",".join(HENNEPIN_FIELDS),
+        "f": "json",
+        "returnGeometry": "true",
+        "outSR": 4326,  # WGS84 if service supports transformation
+    }
+    data = _arcgis_query(params)
+    feats = data.get("features") or []
+    if not feats:
+        return None
+
+    feat = feats[0]
+    attrs = feat.get("attributes") or {}
+    geom = feat.get("geometry") or {}
+
+    delq_year = parse_2digit_year(attrs.get("EARLIEST_DELQ_YR"))
+    yrs_delq = (now_year() - delq_year) if delq_year else None
+
+    return {
+        "pid": pid,
+        "owner_name": normalize_ws(str(attrs.get("OWNER_NM") or "")),
+        "situs_address": build_situs_address(attrs),
+        "situs_city": normalize_ws(str(attrs.get("MUNIC_NM") or "")),
+        "situs_zip": normalize_ws(str(attrs.get("ZIP_CD") or "")),
+        "mailing_city": normalize_ws(str(attrs.get("MAILING_MUNIC_NM") or "")),
+        "property_type": normalize_ws(str(attrs.get("PR_TYP_NM1") or "")),
+        "homestead_code": normalize_ws(str(attrs.get("HMSTD_CD1") or "")),
+        "sale_date": parse_date_maybe(attrs.get("SALE_DATE")),
+        "sale_price": safe_int(attrs.get("SALE_PRICE")),
+        "market_value_total": safe_int(attrs.get("MKT_VAL_TOT")),
+        "earliest_delq_year": delq_year,
+        "years_delinquent": yrs_delq,
+        "forfeited": (str(attrs.get("FORFEIT_LAND_IND") or "").upper() == "Y"),
+        "absentee": is_absentee(attrs),
+        "geometry": geom,
+    }
+
+def get_comps_for_pid(pid: str, radius_m: int = 800, max_comps: int = 15, value_band_pct: int = 30) -> Optional[pd.DataFrame]:
+    """
+    Finds nearby parcels within radius_m (meters) of the subject parcel centroid,
+    then filters comps by market value band and returns top results.
+    Uses ArcGIS query geometry + distance + units pattern. :contentReference[oaicite:5]{index=5}
+    """
+    subj = get_parcel_by_pid(pid)
+    if subj is None:
+        return None
+
+    geom = subj.get("geometry") or {}
+    # Determine centroid from polygon rings (common for parcel boundaries)
+    centroid = None
+    if "rings" in geom:
+        centroid = _polygon_centroid(geom.get("rings"))
+    elif "x" in geom and "y" in geom:
+        centroid = (geom["x"], geom["y"])
+
+    if centroid is None:
+        return None
+
+    cx, cy = centroid[0], centroid[1]
+
+    # Spatial query for nearby parcels
+    # ArcGIS supports geometry + distance + units for buffered queries. :contentReference[oaicite:6]{index=6}
+    params = {
+        "f": "json",
+        "where": "1=1",
+        "outFields": ",".join(HENNEPIN_FIELDS),
+        "returnGeometry": "false",
+        "geometry": json.dumps({"x": cx, "y": cy, "spatialReference": {"wkid": 4326}}),
+        "geometryType": "esriGeometryPoint",
+        "spatialRel": "esriSpatialRelIntersects",
+        "distance": radius_m,
+        "units": "esriSRUnit_Meter",
+        "resultRecordCount": max_comps * 4,  # get more, then filter
+    }
+    data = _arcgis_query(params)
+    feats = data.get("features") or []
+    if not feats:
+        return None
+
+    rows = []
+    subj_mv = subj.get("market_value_total")
+    lo = hi = None
+    if isinstance(subj_mv, (int, float)) and subj_mv > 0:
+        band = value_band_pct / 100.0
+        lo = subj_mv * (1.0 - band)
+        hi = subj_mv * (1.0 + band)
+
+    for f in feats:
+        a = f.get("attributes") or {}
+        comp_pid = str(a.get("PID") or "").strip()
+        if not comp_pid or comp_pid == pid:
+            continue
+
+        mv = safe_int(a.get("MKT_VAL_TOT"))
+        if lo is not None and hi is not None and mv is not None:
+            if mv < lo or mv > hi:
+                continue
+
+        rows.append({
+            "pid": comp_pid,
+            "situs_address": build_situs_address(a),
+            "situs_city": normalize_ws(str(a.get("MUNIC_NM") or "")),
+            "zip": normalize_ws(str(a.get("ZIP_CD") or "")),
+            "property_type": normalize_ws(str(a.get("PR_TYP_NM1") or "")),
+            "market_value_total": mv,
+            "sale_date": parse_date_maybe(a.get("SALE_DATE")),
+            "sale_price": safe_int(a.get("SALE_PRICE")),
+            "homestead_code": normalize_ws(str(a.get("HMSTD_CD1") or "")),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    # Rank comps: closest to subject market value, then most recent sale date
+    if isinstance(subj_mv, (int, float)) and "market_value_total" in df.columns:
+        df["mv_delta"] = (df["market_value_total"] - subj_mv).abs()
+        df = df.sort_values(by=["mv_delta"], ascending=[True])
+
+    return df.head(max_comps)
