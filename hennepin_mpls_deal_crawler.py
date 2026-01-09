@@ -16,7 +16,7 @@ from dateutil import parser as dateparser
 # Global Config
 # =========================
 
-USER_AGENT = "HennepinMplsDealCrawler/1.2 (+public data; polite)"
+USER_AGENT = "HennepinMplsDealCrawler/1.3 (+public data; polite)"
 PAGE_SIZE = 2000
 
 HENNEPIN_LAYER_QUERY_URL = (
@@ -40,8 +40,6 @@ HENNEPIN_FIELDS = [
     "EARLIEST_DELQ_YR",
     "FORFEIT_LAND_IND",
 ]
-
-# Geometry fields are returned separately; we keep attributes list same.
 
 MPLS_VBR_VIEW_URL = (
     "https://tableau.minneapolismn.gov/views/"
@@ -77,6 +75,20 @@ def normalize_addr(a: str) -> str:
     a = a.replace(" PLACE", " PL").replace(" COURT", " CT")
     a = re.sub(r"\s+", " ", a).strip()
     return a
+
+def digits_only(x: Any) -> str:
+    return "".join(ch for ch in str(x or "") if ch.isdigit())
+
+def format_pid(pid_raw: Any) -> str:
+    """
+    Format PID to: ##-###-##-###-####
+    Preserves leading zeros.
+    If not 14 digits, returns cleaned original as string.
+    """
+    d = digits_only(pid_raw)
+    if len(d) != 14:
+        return str(pid_raw or "").strip()
+    return f"{d[0:2]}-{d[2:5]}-{d[5:7]}-{d[7:10]}-{d[10:14]}"
 
 def parse_2digit_year(x: Any) -> Optional[int]:
     if x is None:
@@ -125,15 +137,13 @@ def parse_date_maybe(x: Any) -> Optional[str]:
 # County property page link
 # =========================
 
-def hennepin_pins_pid_url(pid: str) -> str:
+def hennepin_pins_pid_url(pid_any: str) -> str:
     """
-    Hennepin Property Information Search (PINS).
-    This site discourages scraping; we only link out. :contentReference[oaicite:4]{index=4}
+    Link out to county PINS search using digits-only PID.
+    Works whether you pass raw digits or formatted PID.
     """
-    pid = (pid or "").strip()
-    # This is the official PID search entry point.
-    # Adding pid=... may or may not prefill; user can paste PID if needed.
-    return f"https://www16.co.hennepin.mn.us/pins/?articleId=by_pid&pid={pid}"
+    d = digits_only(pid_any)
+    return f"https://www16.co.hennepin.mn.us/pins/?articleId=by_pid&pid={d}"
 
 # =========================
 # Data model
@@ -141,7 +151,8 @@ def hennepin_pins_pid_url(pid: str) -> str:
 
 @dataclass
 class ParcelLead:
-    pid: str
+    pid_raw: str  # digits-only
+    pid: str      # formatted ##-###-##-###-####
     owner_name: str
     situs_address: str
     situs_city: str
@@ -208,7 +219,7 @@ def iter_hennepin_features(where: str, out_fields: List[str], logger: Logger = N
     return feats_all
 
 # =========================
-# Tableau extraction (same fixed version as before)
+# Tableau extraction (fixed)
 # =========================
 
 class TableauExtractor:
@@ -247,7 +258,6 @@ class TableauExtractor:
         parsed = urlparse(view_url)
         base = f"{parsed.scheme}://{parsed.netloc}"
         bootstrap_url = urljoin(base, vizql_path)
-
         log_msg(self.logger, f"Tableau bootstrap endpoint: {bootstrap_url}")
 
         payload = {
@@ -257,8 +267,8 @@ class TableauExtractor:
             ":showVizHome": "no",
             ":embed": "y",
         }
-
         headers = {"Referer": view_url, "Accept": "application/json,text/plain,*/*"}
+
         br = self.s.post(bootstrap_url, data=payload, headers=headers, timeout=60, allow_redirects=True)
         log_msg(self.logger, f"Tableau bootstrap status={br.status_code} url={br.url}")
         br.raise_for_status()
@@ -327,7 +337,7 @@ def fetch_mpls_tables(enable_mpls: bool, logger: Logger = None) -> Tuple[Optiona
     return vbr, viol
 
 # =========================
-# Matching/stacking helpers (same as before)
+# Matching/stacking
 # =========================
 
 def match_by_address(
@@ -523,7 +533,7 @@ def score_lead(
     return score, notes
 
 # =========================
-# Main runner (writes CSV)
+# Main runner (CSV)
 # =========================
 
 def build_where_clause(cities: Optional[List[str]]) -> str:
@@ -556,8 +566,11 @@ def run(
 
     for f in feats:
         attrs = f.get("attributes") or {}
-        pid = str(attrs.get("PID") or "").strip()
-        if not pid:
+
+        pid_raw = digits_only(attrs.get("PID") or "")
+        pid = format_pid(pid_raw)
+
+        if not pid_raw:
             continue
 
         delq_year = parse_2digit_year(attrs.get("EARLIEST_DELQ_YR"))
@@ -572,6 +585,7 @@ def run(
         score, notes = score_lead(attrs, mpls_vacant, condemned_date, vio_cnt, open_vio_cnt)
 
         leads.append(ParcelLead(
+            pid_raw=pid_raw,
             pid=pid,
             owner_name=normalize_ws(str(attrs.get("OWNER_NM") or "")),
             situs_address=build_situs_address(attrs),
@@ -599,9 +613,15 @@ def run(
     leads.sort(key=lambda x: x.score, reverse=True)
     rows = [asdict(l) for l in leads[:top_n]]
 
+    # ✅ Ensure PID stays properly formatted in output + add Excel-safe column
+    for r in rows:
+        r["pid_raw"] = digits_only(r.get("pid_raw", ""))
+        r["pid"] = format_pid(r.get("pid_raw") or r.get("pid"))
+        r["pid_excel"] = "'" + r["pid"] if r["pid"] else ""
+
     if not rows:
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["pid"])
+            csv.writer(f).writerow(["pid_raw", "pid"])
         return
 
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
@@ -612,14 +632,10 @@ def run(
     log_msg(logger, f"Exported {len(rows)} rows -> {out_csv}")
 
 # =========================
-# Comparable analysis helpers (NEW)
+# Comparable analysis helpers
 # =========================
 
 def _polygon_centroid(rings: List[List[List[float]]]) -> Optional[Tuple[float, float]]:
-    """
-    Very lightweight centroid for polygon rings (Web Mercator or WGS84).
-    We approximate centroid using standard polygon centroid on the first ring.
-    """
     if not rings or not rings[0]:
         return None
     pts = rings[0]
@@ -631,7 +647,7 @@ def _polygon_centroid(rings: List[List[List[float]]]) -> Optional[Tuple[float, f
     cy = 0.0
     for i in range(len(pts) - 1):
         x0, y0 = pts[i][0], pts[i][1]
-        x1, y1 = pts[i+1][0], pts[i+1][1]
+        x1, y1 = pts[i + 1][0], pts[i + 1][1]
         cross = x0 * y1 - x1 * y0
         area += cross
         cx += (x0 + x1) * cross
@@ -639,7 +655,6 @@ def _polygon_centroid(rings: List[List[List[float]]]) -> Optional[Tuple[float, f
 
     area *= 0.5
     if abs(area) < 1e-9:
-        # fallback: average points
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         return (sum(xs) / len(xs), sum(ys) / len(ys))
@@ -655,21 +670,20 @@ def _arcgis_query(params: Dict[str, Any]) -> Dict[str, Any]:
     r.raise_for_status()
     return r.json()
 
-def get_parcel_by_pid(pid: str) -> Optional[Dict[str, Any]]:
+def get_parcel_by_pid(pid_any: str) -> Optional[Dict[str, Any]]:
     """
-    Pull a single parcel record by PID (from ArcGIS parcel layer).
-    Returns normalized dict used by the comps page.
+    Accepts raw digits or formatted PID. Queries ArcGIS by raw digits.
     """
-    pid = (pid or "").strip()
-    if not pid:
+    pid_raw = digits_only(pid_any)
+    if not pid_raw:
         return None
 
     params = {
-        "where": f"PID = '{pid}'",
+        "where": f"PID = '{pid_raw}'",
         "outFields": ",".join(HENNEPIN_FIELDS),
         "f": "json",
         "returnGeometry": "true",
-        "outSR": 4326,  # WGS84 if service supports transformation
+        "outSR": 4326,
     }
     data = _arcgis_query(params)
     feats = data.get("features") or []
@@ -684,7 +698,8 @@ def get_parcel_by_pid(pid: str) -> Optional[Dict[str, Any]]:
     yrs_delq = (now_year() - delq_year) if delq_year else None
 
     return {
-        "pid": pid,
+        "pid_raw": pid_raw,
+        "pid": format_pid(pid_raw),
         "owner_name": normalize_ws(str(attrs.get("OWNER_NM") or "")),
         "situs_address": build_situs_address(attrs),
         "situs_city": normalize_ws(str(attrs.get("MUNIC_NM") or "")),
@@ -702,18 +717,12 @@ def get_parcel_by_pid(pid: str) -> Optional[Dict[str, Any]]:
         "geometry": geom,
     }
 
-def get_comps_for_pid(pid: str, radius_m: int = 800, max_comps: int = 15, value_band_pct: int = 30) -> Optional[pd.DataFrame]:
-    """
-    Finds nearby parcels within radius_m (meters) of the subject parcel centroid,
-    then filters comps by market value band and returns top results.
-    Uses ArcGIS query geometry + distance + units pattern. :contentReference[oaicite:5]{index=5}
-    """
-    subj = get_parcel_by_pid(pid)
+def get_comps_for_pid(pid_any: str, radius_m: int = 800, max_comps: int = 15, value_band_pct: int = 30) -> Optional[pd.DataFrame]:
+    subj = get_parcel_by_pid(pid_any)
     if subj is None:
         return None
 
     geom = subj.get("geometry") or {}
-    # Determine centroid from polygon rings (common for parcel boundaries)
     centroid = None
     if "rings" in geom:
         centroid = _polygon_centroid(geom.get("rings"))
@@ -725,8 +734,6 @@ def get_comps_for_pid(pid: str, radius_m: int = 800, max_comps: int = 15, value_
 
     cx, cy = centroid[0], centroid[1]
 
-    # Spatial query for nearby parcels
-    # ArcGIS supports geometry + distance + units for buffered queries. :contentReference[oaicite:6]{index=6}
     params = {
         "f": "json",
         "where": "1=1",
@@ -737,7 +744,7 @@ def get_comps_for_pid(pid: str, radius_m: int = 800, max_comps: int = 15, value_
         "spatialRel": "esriSpatialRelIntersects",
         "distance": radius_m,
         "units": "esriSRUnit_Meter",
-        "resultRecordCount": max_comps * 4,  # get more, then filter
+        "resultRecordCount": max_comps * 4,
     }
     data = _arcgis_query(params)
     feats = data.get("features") or []
@@ -752,10 +759,12 @@ def get_comps_for_pid(pid: str, radius_m: int = 800, max_comps: int = 15, value_
         lo = subj_mv * (1.0 - band)
         hi = subj_mv * (1.0 + band)
 
+    subj_pid_raw = subj.get("pid_raw")
+
     for f in feats:
         a = f.get("attributes") or {}
-        comp_pid = str(a.get("PID") or "").strip()
-        if not comp_pid or comp_pid == pid:
+        comp_pid_raw = digits_only(a.get("PID") or "")
+        if not comp_pid_raw or comp_pid_raw == subj_pid_raw:
             continue
 
         mv = safe_int(a.get("MKT_VAL_TOT"))
@@ -764,7 +773,8 @@ def get_comps_for_pid(pid: str, radius_m: int = 800, max_comps: int = 15, value_
                 continue
 
         rows.append({
-            "pid": comp_pid,
+            "pid_raw": comp_pid_raw,
+            "pid": format_pid(comp_pid_raw),
             "situs_address": build_situs_address(a),
             "situs_city": normalize_ws(str(a.get("MUNIC_NM") or "")),
             "zip": normalize_ws(str(a.get("ZIP_CD") or "")),
@@ -775,11 +785,11 @@ def get_comps_for_pid(pid: str, radius_m: int = 800, max_comps: int = 15, value_
             "homestead_code": normalize_ws(str(a.get("HMSTD_CD1") or "")),
         })
 
-    if not rows:
-        return pd.DataFrame()
-
     df = pd.DataFrame(rows)
-    # Rank comps: closest to subject market value, then most recent sale date
+    if df.empty:
+        return df
+
+    # Rank by closeness to subject market value
     if isinstance(subj_mv, (int, float)) and "market_value_total" in df.columns:
         df["mv_delta"] = (df["market_value_total"] - subj_mv).abs()
         df = df.sort_values(by=["mv_delta"], ascending=[True])
