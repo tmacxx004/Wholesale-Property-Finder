@@ -42,6 +42,7 @@ if "results_df" not in st.session_state:
 
 if run_btn:
     logs = []
+
     def log(msg: str):
         logs.append(msg)
         if show_debug:
@@ -83,7 +84,7 @@ st.download_button("Download CSV", csv_bytes, "ranked_leads.csv", "text/csv")
 
 st.subheader("Results")
 
-# Simple pagination
+# Pagination
 total = len(df)
 total_pages = max(1, (total + page_size - 1) // page_size)
 page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
@@ -93,8 +94,7 @@ slice_df = df.iloc[start:end].copy()
 
 st.caption(f"Showing rows {start+1:,}–{end:,} of {total:,}")
 
-# Render as a Zillow-style list (fast + works great with icons)
-for _, row in slice_df.iterrows():
+for idx, row in slice_df.iterrows():
     pid = str(row.get("pid", "")).strip()
     addr = str(row.get("situs_address", "")).strip()
     city = str(row.get("situs_city", "")).strip()
@@ -119,15 +119,10 @@ for _, row in slice_df.iterrows():
             st.write(f"**Sale Price:** {row.get('sale_price', '')}")
 
         with c3:
-            # 🏛️ county property page link
             st.link_button("🏛️", county_url, help="Open Hennepin County property search (PID)")
 
         with c4:
-            # 📊 comparable analysis inside Streamlit
-            # st.page_link works reliably in multipage Streamlit apps
-            st.page_link(
-                "pages/1_Comparable_Analysis.py",
-                label="📊",
-                help="Open comparable analysis",
-                query_params={"pid": pid}
-            )
+            # ✅ Reliable navigation: set session state + switch page
+            if st.button("📊", key=f"comp_{pid}_{idx}", help="Open comparable analysis"):
+                st.session_state.selected_pid = pid
+                st.switch_page("pages/comparable_analysis.py")
