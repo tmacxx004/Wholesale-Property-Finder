@@ -10,6 +10,9 @@ from hennepin_mpls_deal_crawler import (
     get_comps_for_pid,
 )
 
+# NorthstarMLS RESO Web API client (you added this file)
+from northstar_mls_client import NorthstarResoClient
+
 st.set_page_config(page_title="Wholesale Property Finder", layout="wide")
 
 # -------------------------
@@ -54,7 +57,7 @@ def render_results():
     st.title("Wholesale Property Finder — Hennepin County MN (+ optional Minneapolis stacking)")
     st.caption(
         "Generate a prioritized lead list from Hennepin distress signals and optionally stack Minneapolis datasets. "
-        "Each result includes actions: 🏛️ county property page + 📊 comparable analysis."
+        "Each result includes actions: 🏛️ county property page + 📊 comparable analysis (with NorthstarMLS details if available)."
     )
 
     run_btn = st.button("Run crawler", type="primary")
@@ -78,7 +81,7 @@ def render_results():
                     out_csv=tmp.name,
                     logger=log,
                 )
-                # ✅ Force PID columns to be text (prevents leading zeros / formatting loss)
+                # ✅ Keep PID text formatting
                 df = pd.read_csv(
                     tmp.name,
                     dtype={"pid": "string", "pid_raw": "string"},
@@ -118,8 +121,8 @@ def render_results():
     st.caption(f"Showing rows {start+1:,}–{end:,} of {total:,}")
 
     for idx, row in slice_df.iterrows():
-        pid = str(row.get("pid", "")).strip()          # ✅ formatted: ##-###-##-###-####
-        pid_raw = str(row.get("pid_raw", "")).strip()  # ✅ digits-only
+        pid = str(row.get("pid", "")).strip()          # formatted ##-###-##-###-####
+        pid_raw = str(row.get("pid_raw", "")).strip()  # digits-only
         addr = str(row.get("situs_address", "")).strip()
         city = str(row.get("situs_city", "")).strip()
         zipc = str(row.get("situs_zip", "")).strip()
@@ -147,18 +150,20 @@ def render_results():
 
             with c4:
                 if st.button("📊", key=f"comp_{pid}_{idx}", help="Open comparable analysis"):
-                    # ✅ route with query params, pass pid_raw for reliability
                     st.query_params["view"] = "comps"
+                    # Pass raw digits for best reliability with ArcGIS/MLS
                     st.query_params["pid"] = pid_raw or pid
                     st.rerun()
 
 
 # -------------------------
-# Comparable analysis view
+# Comparable analysis view (County + NorthstarMLS)
 # -------------------------
 def render_comps(pid_any: str):
-    st.title("Comparable Analysis")
-    st.caption("Zillow-style snapshot + nearby comparable parcels using Hennepin parcel data.")
+    st.title("Comparable Analysis (County + NorthstarMLS)")
+    st.caption(
+        "County parcel snapshot + NorthstarMLS listing details and photos (requires valid Northstar credentials/permissions)."
+    )
 
     colA, colB, colC = st.columns([2, 2, 6])
     with colA:
@@ -172,7 +177,10 @@ def render_comps(pid_any: str):
         st.warning("No PID provided. Go back to Results and click 📊 on a property.")
         return
 
-    with st.spinner("Loading subject property…"):
+    # -------------------------
+    # County parcel (subject)
+    # -------------------------
+    with st.spinner("Loading county parcel…"):
         subj = get_parcel_by_pid(pid_any)
 
     if subj is None:
@@ -195,7 +203,7 @@ def render_comps(pid_any: str):
     st.subheader(f"{addr}, {city} {zipc}")
 
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Market Value", f"${mv:,.0f}" if isinstance(mv, (int, float)) else str(mv))
+    k1.metric("County Market Value", f"${mv:,.0f}" if isinstance(mv, (int, float)) else str(mv))
     k2.metric("Last Sale Price", f"${sale_price:,.0f}" if isinstance(sale_price, (int, float)) else str(sale_price))
     k3.metric("Last Sale Date", sale_date or "—")
     k4.metric("Property Type", ptype or "—")
@@ -210,22 +218,121 @@ def render_comps(pid_any: str):
         flags.append("Absentee owner")
     if homestead and str(homestead).upper() != "H":
         flags.append(f"Non-homestead ({homestead})")
-
     if flags:
         st.info(" • ".join(flags))
 
     st.divider()
-    st.subheader("Comparable Sales / Nearby Parcels (Zillow-style comps)")
 
+    # -------------------------
+    # NorthstarMLS section
+    # -------------------------
+    st.subheader("NorthstarMLS Listing Details (if matched)")
+    st.caption("This section requires NORTHSTAR_CLIENT_ID and NORTHSTAR_CLIENT_SECRET set in your environment/secrets.")
+
+    mls_error = None
+    mls_property = None
+    mls_media = []
+
+    with st.spinner("Searching NorthstarMLS by address…"):
+        try:
+            mls = NorthstarResoClient()
+
+            # Search by UnparsedAddress contains + City + PostalCode
+            matches = mls.search_property_by_address(
+                unparsed_address=addr,
+                city=city,
+                postal_code=zipc,
+                top=5,
+            )
+
+            if matches:
+                # Basic pick: first match
+                candidate = matches[0]
+                listing_key = str(candidate.get("ListingKey") or "").strip()
+
+                # Fetch full record (try expand Media)
+                if listing_key:
+                    mls_property = mls.get_property_by_listing_key(listing_key, expand_media=True)
+
+                    # Pull Media
+                    if isinstance(mls_property, dict) and isinstance(mls_property.get("Media"), list):
+                        mls_media = mls_property.get("Media") or []
+                    else:
+                        mls_media = mls.get_media_for_listing_key(listing_key, top=200)
+                else:
+                    # If ListingKey missing for some reason, still show candidate
+                    mls_property = candidate
+
+        except Exception as e:
+            mls_error = str(e)
+
+    if mls_error:
+        st.warning(
+            "NorthstarMLS data is not available right now. This typically means credentials/permissions are missing "
+            "or the API access is not enabled for your account."
+        )
+        st.code(mls_error)
+
+    if not mls_property:
+        st.info("No NorthstarMLS listing matched this address (or it’s not available via your permissions).")
+    else:
+        # Photos
+        photo_urls = []
+        for m in (mls_media or []):
+            u = m.get("MediaURL") or m.get("MediaUrl") or m.get("MediaUri")
+            if u:
+                photo_urls.append(u)
+
+        if photo_urls:
+            st.write("### Photos")
+            # Render up to 30 photos
+            st.image(photo_urls[:30], use_container_width=True)
+        else:
+            st.info("No MediaURL values were returned for this listing (or media is not exposed to your feed).")
+
+        # Curated quick facts (Zillow-ish)
+        def g(*keys):
+            for k in keys:
+                if k in mls_property and mls_property[k] not in (None, ""):
+                    return mls_property[k]
+            return None
+
+        st.write("### Key MLS Fields (curated)")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("List Price", g("ListPrice", "OriginalListPrice") or "—")
+        c2.metric("Beds", g("BedroomsTotal", "BedsTotal") or "—")
+        c3.metric("Baths", g("BathroomsTotalInteger", "BathroomsTotal") or "—")
+        c4.metric("Sq Ft", g("LivingArea", "LivingAreaTotal") or "—")
+
+        st.write(
+            f"**Status:** {g('StandardStatus','MlsStatus') or '—'}  •  "
+            f"**DOM:** {g('DaysOnMarket','DaysOnMarketCumulative') or '—'}  •  "
+            f"**Year Built:** {g('YearBuilt') or '—'}"
+        )
+
+        # Full raw payload (as you requested: include ALL MLS info they provide)
+        st.write("### All MLS Fields (raw)")
+        st.json(mls_property)
+
+        if mls_media:
+            st.write("### All MLS Media Records (raw)")
+            st.json(mls_media)
+
+    st.divider()
+
+    # -------------------------
+    # County comps (fallback / cross-check)
+    # -------------------------
+    st.subheader("Nearby County Comps (cross-check)")
     c1, c2, c3, _ = st.columns([2, 2, 2, 4])
     with c1:
         radius_m = st.slider("Radius (meters)", 200, 2000, 800, 100)
     with c2:
         max_comps = st.slider("Max comps", 5, 50, 15, 1)
     with c3:
-        value_band = st.slider("Value band (+/- %)", 10, 80, 30, 5)
+        value_band = st.slider("County value band (+/- %)", 10, 80, 30, 5)
 
-    with st.spinner("Finding comps…"):
+    with st.spinner("Finding county comps…"):
         comps_df = get_comps_for_pid(
             pid_any=pid_any,
             radius_m=radius_m,
@@ -234,12 +341,12 @@ def render_comps(pid_any: str):
         )
 
     if comps_df is None or comps_df.empty:
-        st.warning("No comps found with current filters. Try increasing radius or value band.")
+        st.warning("No county comps found with current filters.")
         return
 
     vals = pd.to_numeric(comps_df.get("market_value_total"), errors="coerce").dropna()
     if len(vals) >= 3:
-        st.success(f"Directional ARV hint (median market value of comps): **${vals.median():,.0f}**")
+        st.success(f"Directional ARV hint (median county market value of comps): **${vals.median():,.0f}**")
 
     st.dataframe(comps_df, use_container_width=True)
 
@@ -247,9 +354,9 @@ def render_comps(pid_any: str):
     st.subheader("Next steps (wholesale workflow)")
     st.markdown(
         """
-- Confirm motivation stack: delinquency years, absentee, forfeiture indicators, and any city violations (if stacked).
-- Confirm condition: photos, drive-by, and neighborhood comps.
-- Offer math: **ARV × (0.70–0.80) − Repairs − Assignment fee** (adjust to your buyer pool).
+- Validate motivation: delinquency years, absentee, forfeiture indicators, and any city violations (if stacked).
+- Validate condition: MLS photos, drive-by, and neighborhood comps.
+- Offer math: **ARV × (0.70–0.80) − Repairs − Assignment fee** (tune to your buyer pool).
 """
     )
 
