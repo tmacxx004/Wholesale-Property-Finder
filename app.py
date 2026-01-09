@@ -13,13 +13,13 @@ from hennepin_mpls_deal_crawler import (
 st.set_page_config(page_title="Wholesale Property Finder", layout="wide")
 
 # -------------------------
-# Simple router using query params
+# Router via query params
 # -------------------------
 view = (st.query_params.get("view") or "results").strip().lower()
 pid_qp = (st.query_params.get("pid") or "").strip()
 
 # -------------------------
-# Shared sidebar controls
+# Shared sidebar
 # -------------------------
 default_city_list = [
     "Minneapolis", "Bloomington", "Brooklyn Park", "Brooklyn Center", "Richfield",
@@ -46,6 +46,7 @@ with st.sidebar:
 if "results_df" not in st.session_state:
     st.session_state.results_df = None
 
+
 # -------------------------
 # Results view
 # -------------------------
@@ -60,6 +61,7 @@ def render_results():
 
     if run_btn:
         logs = []
+
         def log(msg: str):
             logs.append(msg)
             if show_debug:
@@ -76,7 +78,12 @@ def render_results():
                     out_csv=tmp.name,
                     logger=log,
                 )
-                df = pd.read_csv(tmp.name)
+                # ✅ Force PID columns to be text (prevents leading zeros / formatting loss)
+                df = pd.read_csv(
+                    tmp.name,
+                    dtype={"pid": "string", "pid_raw": "string"},
+                    keep_default_na=False,
+                )
             finally:
                 try:
                     os.unlink(tmp.name)
@@ -94,13 +101,13 @@ def render_results():
         st.warning("No results returned. Try removing city filters or disabling Minneapolis stacking.")
         return
 
-    # download
+    # Download
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     st.download_button("Download CSV", csv_bytes, "ranked_leads.csv", "text/csv")
 
     st.subheader("Results")
 
-    # pagination
+    # Pagination
     total = len(df)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
@@ -111,7 +118,8 @@ def render_results():
     st.caption(f"Showing rows {start+1:,}–{end:,} of {total:,}")
 
     for idx, row in slice_df.iterrows():
-        pid = str(row.get("pid", "")).strip()
+        pid = str(row.get("pid", "")).strip()          # ✅ formatted: ##-###-##-###-####
+        pid_raw = str(row.get("pid_raw", "")).strip()  # ✅ digits-only
         addr = str(row.get("situs_address", "")).strip()
         city = str(row.get("situs_city", "")).strip()
         zipc = str(row.get("situs_zip", "")).strip()
@@ -119,7 +127,7 @@ def render_results():
         score = row.get("score", "")
         notes = str(row.get("score_notes", ""))
 
-        county_url = hennepin_pins_pid_url(pid)
+        county_url = hennepin_pins_pid_url(pid_raw or pid)
 
         with st.container(border=True):
             c1, c2, c3, c4 = st.columns([6, 2, 1, 1])
@@ -138,35 +146,34 @@ def render_results():
                 st.link_button("🏛️", county_url, help="Open Hennepin County property search (PID)")
 
             with c4:
-                # ✅ Route to comps view via query params (reliable on Streamlit Cloud)
                 if st.button("📊", key=f"comp_{pid}_{idx}", help="Open comparable analysis"):
+                    # ✅ route with query params, pass pid_raw for reliability
                     st.query_params["view"] = "comps"
-                    st.query_params["pid"] = pid
+                    st.query_params["pid"] = pid_raw or pid
                     st.rerun()
 
 
 # -------------------------
 # Comparable analysis view
 # -------------------------
-def render_comps(pid: str):
+def render_comps(pid_any: str):
     st.title("Comparable Analysis")
     st.caption("Zillow-style snapshot + nearby comparable parcels using Hennepin parcel data.")
 
-    # Back button
     colA, colB, colC = st.columns([2, 2, 6])
     with colA:
-        st.link_button("🏛️ County Property Page", hennepin_pins_pid_url(pid))
+        st.link_button("🏛️ County Property Page", hennepin_pins_pid_url(pid_any))
     with colB:
         if st.button("⬅️ Back to Results"):
             st.query_params.clear()
             st.rerun()
 
-    if not pid:
+    if not pid_any:
         st.warning("No PID provided. Go back to Results and click 📊 on a property.")
         return
 
     with st.spinner("Loading subject property…"):
-        subj = get_parcel_by_pid(pid)
+        subj = get_parcel_by_pid(pid_any)
 
     if subj is None:
         st.error("Could not load the subject property from the parcel service.")
@@ -220,7 +227,7 @@ def render_comps(pid: str):
 
     with st.spinner("Finding comps…"):
         comps_df = get_comps_for_pid(
-            pid=pid,
+            pid_any=pid_any,
             radius_m=radius_m,
             max_comps=max_comps,
             value_band_pct=value_band,
@@ -230,7 +237,6 @@ def render_comps(pid: str):
         st.warning("No comps found with current filters. Try increasing radius or value band.")
         return
 
-    # ARV hint
     vals = pd.to_numeric(comps_df.get("market_value_total"), errors="coerce").dropna()
     if len(vals) >= 3:
         st.success(f"Directional ARV hint (median market value of comps): **${vals.median():,.0f}**")
