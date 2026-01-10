@@ -1,3 +1,4 @@
+# hennepin_mpls_deal_crawler.py
 import re
 import csv
 import json
@@ -54,18 +55,23 @@ MPLS_VIOL_VIEW_URL = (
 
 Logger = Optional[Callable[[str], None]]
 
+
 def log_msg(logger: Logger, msg: str):
     if logger:
         logger(msg)
 
+
 def polite_sleep(sec: float = 0.25):
     time.sleep(sec)
+
 
 def now_year() -> int:
     return datetime.now().year
 
+
 def normalize_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
+
 
 def normalize_addr(a: str) -> str:
     a = normalize_ws(a).upper()
@@ -76,19 +82,21 @@ def normalize_addr(a: str) -> str:
     a = re.sub(r"\s+", " ", a).strip()
     return a
 
+
 def digits_only(x: Any) -> str:
     return "".join(ch for ch in str(x or "") if ch.isdigit())
 
+
 def format_pid(pid_raw: Any) -> str:
     """
-    Format PID to: ##-###-##-###-####
-    Preserves leading zeros.
-    If not 14 digits, returns cleaned original as string.
+    Enforce PID display format: ##-###-##-###-####
+    Preserves leading zeros. If not 14 digits, returns string as-is.
     """
     d = digits_only(pid_raw)
     if len(d) != 14:
         return str(pid_raw or "").strip()
     return f"{d[0:2]}-{d[2:5]}-{d[5:7]}-{d[7:10]}-{d[10:14]}"
+
 
 def parse_2digit_year(x: Any) -> Optional[int]:
     if x is None:
@@ -100,6 +108,7 @@ def parse_2digit_year(x: Any) -> Optional[int]:
     cy = now_year() % 100
     return (2000 + yy) if yy <= cy else (1900 + yy)
 
+
 def safe_int(x: Any) -> Optional[int]:
     try:
         if x is None:
@@ -108,6 +117,7 @@ def safe_int(x: Any) -> Optional[int]:
     except Exception:
         return None
 
+
 def build_situs_address(attrs: Dict[str, Any]) -> str:
     house_no = str(attrs.get("HOUSE_NO") or "").strip()
     frac = normalize_ws(str(attrs.get("FRAC_HOUSE_NO") or "")).strip()
@@ -115,12 +125,14 @@ def build_situs_address(attrs: Dict[str, Any]) -> str:
     parts = [p for p in [house_no, frac, street] if p]
     return normalize_ws(" ".join(parts))
 
+
 def is_absentee(attrs: Dict[str, Any]) -> bool:
     situs = normalize_ws(str(attrs.get("MUNIC_NM") or "")).upper()
     mail = normalize_ws(str(attrs.get("MAILING_MUNIC_NM") or "")).upper()
     if not situs or not mail:
         return False
     return situs != mail
+
 
 def parse_date_maybe(x: Any) -> Optional[str]:
     if x is None:
@@ -133,21 +145,15 @@ def parse_date_maybe(x: Any) -> Optional[str]:
     except Exception:
         return None
 
-# =========================
-# County property page link
-# =========================
 
 def hennepin_pins_pid_url(pid_any: str) -> str:
     """
     Link out to county PINS search using digits-only PID.
-    Works whether you pass raw digits or formatted PID.
+    Works whether pid_any is raw digits or formatted PID.
     """
     d = digits_only(pid_any)
     return f"https://www16.co.hennepin.mn.us/pins/?articleId=by_pid&pid={d}"
 
-# =========================
-# Data model
-# =========================
 
 @dataclass
 class ParcelLead:
@@ -181,9 +187,6 @@ class ParcelLead:
     score: float
     score_notes: str
 
-# =========================
-# ArcGIS client
-# =========================
 
 class ArcGISClient:
     def __init__(self):
@@ -194,6 +197,7 @@ class ArcGISClient:
         r = self.s.get(HENNEPIN_LAYER_QUERY_URL, params=params, timeout=60)
         r.raise_for_status()
         return r.json()
+
 
 def iter_hennepin_features(where: str, out_fields: List[str], logger: Logger = None) -> List[Dict[str, Any]]:
     client = ArcGISClient()
@@ -217,6 +221,7 @@ def iter_hennepin_features(where: str, out_fields: List[str], logger: Logger = N
         offset += PAGE_SIZE
         polite_sleep(0.2)
     return feats_all
+
 
 # =========================
 # Tableau extraction (fixed)
@@ -279,7 +284,7 @@ class TableauExtractor:
         if start == -1 or end == -1:
             raise RuntimeError("Unexpected Tableau bootstrap response format (no JSON object found).")
 
-        data = json.loads(txt[start:end+1])
+        data = json.loads(txt[start:end + 1])
         pres = data.get("presModel", {})
         segments = pres.get("dataSegments") or {}
         if not segments:
@@ -312,6 +317,7 @@ class TableauExtractor:
             return df
         return self.bootstrap_df(view_url)
 
+
 def fetch_mpls_tables(enable_mpls: bool, logger: Logger = None) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     if not enable_mpls:
         return None, None
@@ -335,6 +341,7 @@ def fetch_mpls_tables(enable_mpls: bool, logger: Logger = None) -> Tuple[Optiona
         log_msg(logger, f"[WARN] Violations Tableau extract failed: {e}")
 
     return vbr, viol
+
 
 # =========================
 # Matching/stacking
@@ -378,6 +385,7 @@ def match_by_address(
         return best_idx
     return None
 
+
 def infer_vbr_columns(df: pd.DataFrame) -> Dict[str, str]:
     candidates = {
         "address": ["Address", "ADDRESS", "Property Address", "PROPERTY ADDRESS"],
@@ -394,6 +402,7 @@ def infer_vbr_columns(df: pd.DataFrame) -> Dict[str, str]:
                 break
     return resolved
 
+
 def infer_violation_columns(df: pd.DataFrame) -> Dict[str, str]:
     candidates = {
         "address": ["Address", "ADDRESS", "Property Address", "PROPERTY ADDRESS"],
@@ -408,6 +417,7 @@ def infer_violation_columns(df: pd.DataFrame) -> Dict[str, str]:
                 resolved[key] = upper_map[o.upper()]
                 break
     return resolved
+
 
 def stack_mpls(
     attrs: Dict[str, Any],
@@ -471,6 +481,7 @@ def stack_mpls(
 
     return mpls_vacant, condemned_date, vbr_type, violation_count, open_violation_count
 
+
 # =========================
 # Scoring
 # =========================
@@ -532,6 +543,7 @@ def score_lead(
 
     return score, notes
 
+
 # =========================
 # Main runner (CSV)
 # =========================
@@ -542,6 +554,7 @@ def build_where_clause(cities: Optional[List[str]]) -> str:
         return base
     quoted = ",".join([f"'{c.upper()}'" for c in cities])
     return f"({base}) AND (UPPER(MUNIC_NM) IN ({quoted}))"
+
 
 def run(
     cities: Optional[List[str]],
@@ -569,7 +582,6 @@ def run(
 
         pid_raw = digits_only(attrs.get("PID") or "")
         pid = format_pid(pid_raw)
-
         if not pid_raw:
             continue
 
@@ -613,7 +625,7 @@ def run(
     leads.sort(key=lambda x: x.score, reverse=True)
     rows = [asdict(l) for l in leads[:top_n]]
 
-    # ✅ Ensure PID stays properly formatted in output + add Excel-safe column
+    # Enforce PID format in output + excel-safe column
     for r in rows:
         r["pid_raw"] = digits_only(r.get("pid_raw", ""))
         r["pid"] = format_pid(r.get("pid_raw") or r.get("pid"))
@@ -630,6 +642,7 @@ def run(
         w.writerows(rows)
 
     log_msg(logger, f"Exported {len(rows)} rows -> {out_csv}")
+
 
 # =========================
 # Comparable analysis helpers
@@ -663,12 +676,14 @@ def _polygon_centroid(rings: List[List[List[float]]]) -> Optional[Tuple[float, f
     cy /= (6.0 * area)
     return (cx, cy)
 
+
 def _arcgis_query(params: Dict[str, Any]) -> Dict[str, Any]:
     s = requests.Session()
     s.headers.update({"User-Agent": USER_AGENT})
     r = s.get(HENNEPIN_LAYER_QUERY_URL, params=params, timeout=60)
     r.raise_for_status()
     return r.json()
+
 
 def get_parcel_by_pid(pid_any: str) -> Optional[Dict[str, Any]]:
     """
@@ -716,6 +731,7 @@ def get_parcel_by_pid(pid_any: str) -> Optional[Dict[str, Any]]:
         "absentee": is_absentee(attrs),
         "geometry": geom,
     }
+
 
 def get_comps_for_pid(pid_any: str, radius_m: int = 800, max_comps: int = 15, value_band_pct: int = 30) -> Optional[pd.DataFrame]:
     subj = get_parcel_by_pid(pid_any)
@@ -789,7 +805,6 @@ def get_comps_for_pid(pid_any: str, radius_m: int = 800, max_comps: int = 15, va
     if df.empty:
         return df
 
-    # Rank by closeness to subject market value
     if isinstance(subj_mv, (int, float)) and "market_value_total" in df.columns:
         df["mv_delta"] = (df["market_value_total"] - subj_mv).abs()
         df = df.sort_values(by=["mv_delta"], ascending=[True])
