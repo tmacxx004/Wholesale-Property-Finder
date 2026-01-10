@@ -1,12 +1,16 @@
+# =========================
+# FILE: signals_startribune.py
+# =========================
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Callable, Optional, Iterable
+from typing import Callable, Optional, Iterable, Dict, Any, Tuple
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+from rapidfuzz import fuzz, process
 
 
 DEFAULT_HEADERS = {
@@ -51,10 +55,6 @@ def _abs_url(href: str) -> str:
 
 
 def _extract_links_by_prefix(html: str, must_start_with: str) -> list[str]:
-    """
-    More robust than 'must_contain'. We collect any link starting with a path prefix.
-    Example: /mn/foreclosures/...
-    """
     soup = BeautifulSoup(html, "lxml")
     links = []
     for a in soup.find_all("a", href=True):
@@ -145,13 +145,6 @@ def fetch_startribune_foreclosure_notices(
     cities: Optional[Iterable[str]] = None,
     logger: Optional[Callable[[str], None]] = None,
 ) -> pd.DataFrame:
-    """
-    Foreclosures:
-      - Scrape listing page
-      - Extract ad links under /mn/foreclosures/
-      - Visit each ad detail page and parse notice body
-      - Keep only notices matching selected cities (by address text)
-    """
     list_url = f"{BASE}/mn/foreclosures/search?limit=240"
     if logger:
         logger(f"[StarTribune] Foreclosures listing: {list_url}")
@@ -160,7 +153,6 @@ def fetch_startribune_foreclosure_notices(
     r.raise_for_status()
 
     ad_links = _extract_links_by_prefix(r.text, must_start_with="/mn/foreclosures/")
-    # remove listing/search links
     ad_links = [u for u in ad_links if "/search" not in u and "/create" not in u]
     if logger:
         logger(f"[StarTribune] Foreclosures links found: {len(ad_links)}")
@@ -194,7 +186,6 @@ def fetch_startribune_foreclosure_notices(
                 except Exception:
                     pass
 
-            # City match required (your request: show based on city match)
             if cities_list and not any(_city_in_text(c, addr) for c in cities_list):
                 continue
 
@@ -231,13 +222,6 @@ def fetch_startribune_probate_notices(
     cities: Optional[Iterable[str]] = None,
     logger: Optional[Callable[[str], None]] = None,
 ) -> pd.DataFrame:
-    """
-    Probates:
-      - Scrape listing page
-      - Extract ad links under /mn/sub-probates/
-      - Visit each ad detail page and parse notice body
-      - Keep only notices matching selected cities (by representative address text)
-    """
     list_url = f"{BASE}/mn/sub-probates/search?limit=240"
     if logger:
         logger(f"[StarTribune] Probates listing: {list_url}")
@@ -268,7 +252,6 @@ def fetch_startribune_probate_notices(
             court_file = _extract_probate_file(text)
             rep_addr = _extract_probate_rep_address(text)
 
-            # City match required (use rep address, since probate notice often lacks property address)
             if cities_list:
                 hay = rep_addr or text
                 if not any(_city_in_text(c, hay) for c in cities_list):
@@ -300,14 +283,59 @@ def fetch_startribune_probate_notices(
     return pd.DataFrame(out)
 
 
+def _build_fuzzy_index(df: pd.DataFrame) -> Tuple[list[str], Dict[str, int]]:
+    """
+    Returns:
+      - choices: list of normalized addresses
+      - norm_to_index: mapping from norm address -> row index in df (first occurrence)
+    """
+    norms = df.get("situs_address", pd.Series([""] * len(df))).astype(str).map(_norm_addr).tolist()
+    norm_to_index: Dict[str, int] = {}
+    for i, n in enumerate(norms):
+        if n and n not in norm_to_index:
+            norm_to_index[n] = i
+    choices = [n for n in norms if n]
+    return choices, norm_to_index
+
+
+def _fuzzy_best_match(
+    query_norm: str,
+    choices: list[str],
+    *,
+    score_cutoff: int = 92,
+) -> Tuple[str, int]:
+    if not query_norm or not choices:
+        return "", 0
+    # token_set_ratio is great for addresses where order varies slightly
+    res = process.extractOne(query_norm, choices, scorer=fuzz.token_set_ratio, score_cutoff=score_cutoff)
+    if not res:
+        return "", 0
+    match_str, score, _ = res
+    return match_str, int(score)
+
+
 def merge_notices_into_leads(
     leads_df: pd.DataFrame,
     forecl_df: pd.DataFrame,
     probate_df: pd.DataFrame,
+    *,
+    fuzzy_score_cutoff: int = 92,
 ) -> pd.DataFrame:
     """
-    Merge signals into county leads when possible.
-    IMPORTANT: This is only for "enrichment". The app will also show notice-only rows.
+    Foreclosure merge priority:
+      1) PID match (if pid_raw_guess present)
+      2) Exact normalized address match
+      3) Fuzzy address match (when PID not present / no exact match)
+
+    When fuzzy match is used, we set:
+      - foreclosure_match_method = "fuzzy_address"
+      - foreclosure_fuzzy_score = <0-100>
+
+    Exact addr match sets:
+      - foreclosure_match_method = "exact_address"
+
+    PID match sets:
+      - foreclosure_match_method = "pid"
     """
     df = leads_df.copy()
 
@@ -317,38 +345,15 @@ def merge_notices_into_leads(
 
     df["_norm_addr_key"] = df.get("situs_address", "").astype(str).map(_norm_addr)
 
-    # Foreclosure enrichment
+    # Foreclosure enrichment fields
     df["has_mortgage_foreclosure_notice"] = False
     df["foreclosure_sale_date"] = ""
     df["foreclosure_notice_url"] = ""
     df["foreclosure_notice_details"] = ""
+    df["foreclosure_match_method"] = ""           # pid | exact_address | fuzzy_address
+    df["foreclosure_fuzzy_score"] = 0
 
-    if forecl_df is not None and not forecl_df.empty:
-        f = forecl_df.copy()
-        f["pid_raw_guess"] = f.get("pid_raw_guess", "").astype(str).map(_digits_only)
-        f["_norm_addr_key"] = f.get("norm_key", "").astype(str)
-
-        # PID match (rare)
-        pid_hits = f[f["pid_raw_guess"].astype(bool)].drop_duplicates(subset=["pid_raw_guess"])
-        pid_map = pid_hits.set_index("pid_raw_guess").to_dict(orient="index") if not pid_hits.empty else {}
-
-        hit_mask = df["pid_raw"].isin(pid_map.keys())
-        df.loc[hit_mask, "has_mortgage_foreclosure_notice"] = True
-        df.loc[hit_mask, "foreclosure_sale_date"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("event_date", ""))
-        df.loc[hit_mask, "foreclosure_notice_url"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("source_url", ""))
-        df.loc[hit_mask, "foreclosure_notice_details"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("signal_details", ""))
-
-        # Address match (primary)
-        addr_hits = f[f["_norm_addr_key"].astype(bool)].drop_duplicates(subset=["_norm_addr_key"])
-        addr_map = addr_hits.set_index("_norm_addr_key").to_dict(orient="index") if not addr_hits.empty else {}
-
-        hit_mask2 = df["_norm_addr_key"].isin(addr_map.keys()) & (~df["has_mortgage_foreclosure_notice"])
-        df.loc[hit_mask2, "has_mortgage_foreclosure_notice"] = True
-        df.loc[hit_mask2, "foreclosure_sale_date"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("event_date", ""))
-        df.loc[hit_mask2, "foreclosure_notice_url"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("source_url", ""))
-        df.loc[hit_mask2, "foreclosure_notice_details"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("signal_details", ""))
-
-    # Probate enrichment (heuristic by owner last name)
+    # Probate enrichment fields
     df["has_probate_notice"] = False
     df["probate_court_file_no"] = ""
     df["probate_decedent_name"] = ""
@@ -357,6 +362,78 @@ def merge_notices_into_leads(
     df["probate_notice_details"] = ""
     df["probate_mail_crosscheck_status"] = "No data"
 
+    # -------------------------
+    # Foreclosure match
+    # -------------------------
+    if forecl_df is not None and not forecl_df.empty:
+        f = forecl_df.copy()
+        f["pid_raw_guess"] = f.get("pid_raw_guess", "").astype(str).map(_digits_only)
+        f["_norm_addr_key"] = f.get("norm_key", "").astype(str)
+
+        # Build fuzzy index for leads
+        choices, norm_to_idx = _build_fuzzy_index(df)
+
+        # 1) PID match
+        pid_hits = f[f["pid_raw_guess"].astype(bool)].drop_duplicates(subset=["pid_raw_guess"])
+        pid_map = pid_hits.set_index("pid_raw_guess").to_dict(orient="index") if not pid_hits.empty else {}
+
+        hit_mask = df["pid_raw"].isin(pid_map.keys())
+        df.loc[hit_mask, "has_mortgage_foreclosure_notice"] = True
+        df.loc[hit_mask, "foreclosure_sale_date"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("event_date", ""))
+        df.loc[hit_mask, "foreclosure_notice_url"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("source_url", ""))
+        df.loc[hit_mask, "foreclosure_notice_details"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("signal_details", ""))
+        df.loc[hit_mask, "foreclosure_match_method"] = "pid"
+        df.loc[hit_mask, "foreclosure_fuzzy_score"] = 0
+
+        # 2) Exact normalized address match (for those not already matched)
+        addr_hits = f[f["_norm_addr_key"].astype(bool)].drop_duplicates(subset=["_norm_addr_key"])
+        addr_map = addr_hits.set_index("_norm_addr_key").to_dict(orient="index") if not addr_hits.empty else {}
+
+        hit_mask2 = df["_norm_addr_key"].isin(addr_map.keys()) & (~df["has_mortgage_foreclosure_notice"])
+        df.loc[hit_mask2, "has_mortgage_foreclosure_notice"] = True
+        df.loc[hit_mask2, "foreclosure_sale_date"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("event_date", ""))
+        df.loc[hit_mask2, "foreclosure_notice_url"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("source_url", ""))
+        df.loc[hit_mask2, "foreclosure_notice_details"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("signal_details", ""))
+        df.loc[hit_mask2, "foreclosure_match_method"] = "exact_address"
+        df.loc[hit_mask2, "foreclosure_fuzzy_score"] = 0
+
+        # 3) Fuzzy address match for remaining foreclosure notices that:
+        #    - do NOT have a PID or did not match PID
+        #    - do not exact match
+        # We do this by iterating foreclosure signals and assigning them to best lead match (greedy).
+        unmatched_lead_mask = ~df["has_mortgage_foreclosure_notice"]
+        if unmatched_lead_mask.any() and choices:
+            # Create a working map from normalized lead address -> lead row index
+            # (we can later check whether that lead row is still unmatched)
+            for _, sig in f.iterrows():
+                q = str(sig.get("_norm_addr_key", "")).strip()
+                if not q:
+                    continue
+
+                # If this signal has PID, we've already tried PID match; still allow fuzzy for non-matching PID
+                # (because parcel formats often differ). That’s acceptable.
+                best_norm, score = _fuzzy_best_match(q, choices, score_cutoff=fuzzy_score_cutoff)
+                if not best_norm or score <= 0:
+                    continue
+
+                lead_i = norm_to_idx.get(best_norm, None)
+                if lead_i is None:
+                    continue
+
+                # Only attach if that lead is not already matched to foreclosure
+                if bool(df.loc[lead_i, "has_mortgage_foreclosure_notice"]):
+                    continue
+
+                df.loc[lead_i, "has_mortgage_foreclosure_notice"] = True
+                df.loc[lead_i, "foreclosure_sale_date"] = str(sig.get("event_date", "") or "")
+                df.loc[lead_i, "foreclosure_notice_url"] = str(sig.get("source_url", "") or "")
+                df.loc[lead_i, "foreclosure_notice_details"] = str(sig.get("signal_details", "") or "")
+                df.loc[lead_i, "foreclosure_match_method"] = "fuzzy_address"
+                df.loc[lead_i, "foreclosure_fuzzy_score"] = int(score)
+
+    # -------------------------
+    # Probate match (heuristic by owner last name)
+    # -------------------------
     if probate_df is not None and not probate_df.empty and "owner_name" in df.columns:
         p = probate_df.copy()
         p["norm_decedent"] = p.get("norm_decedent", "").astype(str)
@@ -365,7 +442,7 @@ def merge_notices_into_leads(
 
         last_map = p.drop_duplicates(subset=["decedent_last"]).set_index("decedent_last").to_dict(orient="index")
 
-        def _find_probate(owner: str):
+        def _find_probate(owner: str) -> Optional[Dict[str, Any]]:
             owner = _clean(owner).upper()
             for last, rec in last_map.items():
                 if last and last in owner:
@@ -417,6 +494,15 @@ def apply_notice_scoring(df: pd.DataFrame) -> pd.DataFrame:
         mask = d["has_mortgage_foreclosure_notice"].fillna(False)
         d.loc[mask, "score"] = pd.to_numeric(d.loc[mask, "score"], errors="coerce").fillna(0) + 35
         d.loc[mask, "score_notes"] = d.loc[mask, "score_notes"].map(lambda s: add_note(s, "Mortgage foreclosure notice"))
+
+        # add fuzzy detail note (optional)
+        if "foreclosure_match_method" in d.columns and "foreclosure_fuzzy_score" in d.columns:
+            fm = d["foreclosure_match_method"].fillna("")
+            fs = pd.to_numeric(d["foreclosure_fuzzy_score"], errors="coerce").fillna(0).astype(int)
+            fuzzy_mask = (fm == "fuzzy_address") & mask
+            d.loc[fuzzy_mask, "score_notes"] = d.loc[fuzzy_mask, "score_notes"].astype(str) + d.loc[fuzzy_mask].apply(
+                lambda r: f" (fuzzy addr {int(r.get('foreclosure_fuzzy_score', 0))})", axis=1
+            )
 
     if "has_probate_notice" in d.columns:
         mask = d["has_probate_notice"].fillna(False)
