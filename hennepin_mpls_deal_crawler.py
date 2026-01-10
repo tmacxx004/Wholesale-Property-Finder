@@ -1,3 +1,4 @@
+# hennepin_mpls_deal_crawler.py
 import re
 import csv
 import json
@@ -315,11 +316,7 @@ class TableauExtractor:
 
 
 def fetch_mpls_tables(enable_vbr: bool, enable_viol: bool, logger: Logger = None) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """
-    Returns (vbr_df, viol_df) but each can be None depending on flags or failures.
-    """
     t = TableauExtractor(logger=logger)
-
     vbr_df = None
     viol_df = None
 
@@ -432,7 +429,6 @@ def stack_mpls(
     violation_count = 0
     open_violation_count = 0
 
-    # VBR (Vacant/Condemned)
     if vbr_df is not None and not vbr_df.empty:
         cols = infer_vbr_columns(vbr_df)
         idx = match_by_address(
@@ -450,7 +446,6 @@ def stack_mpls(
             if cols.get("vbr_type"):
                 vbr_type = normalize_ws(str(vbr_df.loc[idx, cols["vbr_type"]] or ""))
 
-    # Violations
     if viol_df is not None and not viol_df.empty:
         cols = infer_violation_columns(viol_df)
         addr_col = cols.get("address") or ("Address" if "Address" in viol_df.columns else None)
@@ -577,8 +572,6 @@ def run(
     log_msg(logger, f"WHERE clause: {where}")
 
     feats = iter_hennepin_features(where=where, out_fields=HENNEPIN_FIELDS, logger=logger)
-
-    # Fetch only what user enabled
     vbr_df, viol_df = fetch_mpls_tables(enable_vbr=enable_vbr, enable_viol=enable_viol, logger=logger)
 
     leads: List[ParcelLead] = []
@@ -595,12 +588,10 @@ def run(
         yrs_delq = (now_year() - delq_year) if delq_year else None
         forfeited = (str(attrs.get("FORFEIT_LAND_IND") or "").upper() == "Y")
 
-        # If a dataset is disabled, pass None so it contributes nothing
         vbr_use = vbr_df if enable_vbr else None
         viol_use = viol_df if enable_viol else None
 
         mpls_vacant, condemned_date, vbr_type, vio_cnt, open_vio_cnt = stack_mpls(attrs, vbr_use, viol_use)
-
         score, notes = score_lead(attrs, mpls_vacant, condemned_date, vio_cnt, open_vio_cnt)
 
         leads.append(ParcelLead(
@@ -632,7 +623,6 @@ def run(
     leads.sort(key=lambda x: x.score, reverse=True)
     rows = [asdict(l) for l in leads[:top_n]]
 
-    # Enforce PID format in output + excel-safe
     for r in rows:
         r["pid_raw"] = digits_only(r.get("pid_raw", ""))
         r["pid"] = format_pid(r.get("pid_raw") or r.get("pid"))
@@ -652,7 +642,7 @@ def run(
 
 
 # =========================
-# Comparable analysis helpers (county comps)
+# Comparable analysis helpers
 # =========================
 
 def _polygon_centroid(rings: List[List[List[float]]]) -> Optional[Tuple[float, float]]:
