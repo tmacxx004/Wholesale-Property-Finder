@@ -1,3 +1,4 @@
+# app.py
 import os
 import tempfile
 import urllib.parse
@@ -5,6 +6,7 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from hennepin_mpls_deal_crawler import (
     run,
@@ -145,7 +147,7 @@ def _header_nav():
             st.query_params["view"] = "saved"
             st.rerun()
     with right:
-        st.caption("Tip: ⭐ saves a property to your list. Zillow clicks route through the app to log timestamps.")
+        st.caption("Tip: ☆/★ saves a property. Zillow + comps clicks are timestamped.")
 
 
 def _save_toggle(pid_raw: str) -> bool:
@@ -212,8 +214,8 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
             st.link_button("🏛️", county_url, help="Open Hennepin County property search (PID)")
 
         with c4:
-            # Zillow click is routed through internal view to log timestamp
-            if st.button("🔎", key=f"z_{idx_key}", help="Open Zillow (via app) and log click timestamp"):
+            # Zillow click routes to out-view which logs and redirects immediately
+            if st.button("🔎", key=f"z_{idx_key}", help="Open Zillow immediately (tracked)"):
                 st.query_params.clear()
                 st.query_params["view"] = "out"
                 st.query_params["pid"] = pid_raw
@@ -221,7 +223,7 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
                 st.rerun()
 
         with c5:
-            if st.button("📊", key=f"c_{idx_key}", help="Open comparable analysis and log open timestamp"):
+            if st.button("📊", key=f"c_{idx_key}", help="Open comparable analysis (tracked)"):
                 log_interaction(pid_raw, "comps_opened_at")
                 st.query_params.clear()
                 st.query_params["view"] = "comps"
@@ -242,7 +244,7 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
 # -------------------------
 def render_results():
     st.title("Wholesale Property Finder — Hennepin County MN")
-    st.caption("Actions: 🏛️ county page • 🔎 Zillow link (tracked) • 📊 comps (tracked) • ☆/★ save")
+    st.caption("Actions: 🏛️ county • 🔎 Zillow (tracked) • 📊 comps (tracked) • ☆/★ save")
 
     _header_nav()
 
@@ -264,7 +266,7 @@ def render_results():
                     cities=cities if cities else None,
                     enable_vbr=enable_vbr,
                     enable_viol=enable_viol,
-                    property_types=None,  # filter happens after search now
+                    property_types=None,  # filter happens after search
                     top_n=top_n,
                     out_csv=tmp.name,
                     logger=log,
@@ -282,8 +284,6 @@ def render_results():
 
         df = _enforce_pid_columns(df)
         st.session_state.results_df = df
-
-        # Reset results property type filter when you run a new search
         st.session_state.property_type_filter_results = []
 
     df = st.session_state.results_df
@@ -300,7 +300,6 @@ def render_results():
     pt_options = _property_type_options(df)
 
     if pt_options:
-        # keep selections that still exist
         st.session_state.property_type_filter_results = [
             x for x in st.session_state.property_type_filter_results if x in pt_options
         ]
@@ -357,8 +356,7 @@ def render_saved():
     df = st.session_state.results_df
     if df is None or df.empty:
         st.warning("No results are loaded yet. Run the crawler first so the app can display saved details.")
-        st.caption("Your saved PIDs are still stored for this session.")
-        # Show raw saved list
+        st.caption("Your saved PIDs are stored for this session.")
         st.write(saved)
         return
 
@@ -399,7 +397,6 @@ def render_saved():
 
     st.subheader(f"Saved ({len(df_ui):,})")
 
-    # No pagination needed usually, but keep it consistent
     total = len(df_ui)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = st.number_input("Page (Saved)", min_value=1, max_value=total_pages, value=1, step=1)
@@ -410,28 +407,23 @@ def render_saved():
     st.caption(f"Showing rows {start+1:,}–{end:,} of {total:,}")
 
     for i, row in slice_df.iterrows():
-        _render_property_card(row, idx_key=f"s_{i}", allow_save=True)
+        _render_property_card(row, idx_key=f"sv_{i}", allow_save=True)
 
 
 def render_out(pid_any: str):
     """
     Internal "click-out" view.
-    We route Zillow clicks here so we can log the click timestamp, then present the external link.
+    Logs audit timestamp and immediately redirects to the external destination.
     """
     pid_raw = digits_only(pid_any)
     dest = (st.query_params.get("dest") or "zillow").strip().lower()
-
-    st.title("Leaving the app")
-    _header_nav()
 
     if not pid_raw:
         st.error("Missing PID.")
         return
 
-    # Load parcel to build a clean address-based Zillow search link
-    with st.spinner("Preparing link…"):
-        subj = get_parcel_by_pid(pid_raw)
-
+    # Build destination URL (needs parcel for address-based Zillow link)
+    subj = get_parcel_by_pid(pid_raw)
     if subj is None:
         st.error("Could not load parcel details to build the external link.")
         return
@@ -441,19 +433,45 @@ def render_out(pid_any: str):
     zipc = subj.get("situs_zip", "")
 
     if dest == "zillow":
+        # 1) Log audit
         log_interaction(pid_raw, "zillow_clicked_at")
-        url = zillow_search_url(addr, city, "MN", zipc)
-        st.success(f"Zillow click logged for PID {format_pid(pid_raw)} at {get_interaction(pid_raw, 'zillow_clicked_at')}.")
-        st.link_button("Open Zillow (search)", url)
-    else:
-        st.warning("Unknown destination.")
-        st.write(dest)
 
-    st.divider()
-    if st.button("⬅️ Back", type="primary"):
-        st.query_params.clear()
-        st.query_params["view"] = "results"
-        st.rerun()
+        # 2) Build URL
+        url = zillow_search_url(addr, city, "MN", zipc)
+
+        # 3) Immediate redirect (no second click)
+        components.html(
+            f"""
+            <html>
+              <head>
+                <meta charset="utf-8" />
+                <title>Redirecting…</title>
+                <script>
+                  setTimeout(function() {{
+                    window.location.href = {url!r};
+                  }}, 25);
+                </script>
+              </head>
+              <body></body>
+            </html>
+            """,
+            height=0,
+        )
+
+        # Fallback UI (if redirects blocked)
+        st.success(f"Audit saved: Zillow clicked at {get_interaction(pid_raw, 'zillow_clicked_at')}")
+        st.link_button("If you are not redirected, click here to open Zillow", url)
+
+        if st.button("⬅️ Back to Results", type="primary"):
+            st.query_params.clear()
+            st.query_params["view"] = "results"
+            st.rerun()
+    else:
+        st.warning(f"Unknown destination: {dest}")
+        if st.button("⬅️ Back to Results", type="primary"):
+            st.query_params.clear()
+            st.query_params["view"] = "results"
+            st.rerun()
 
 
 def render_comps(pid_any: str):
@@ -499,7 +517,6 @@ def render_comps(pid_any: str):
     st.subheader(f"{addr}, {city} {zipc}")
     st.write(f"**PID:** {pid_fmt}  •  **Type:** {ptype or '—'}  •  **Owner:** {owner or '—'}")
 
-    # Show click tracking
     st.caption(
         " | ".join(
             [x for x in [
@@ -516,17 +533,13 @@ def render_comps(pid_any: str):
     k3.metric("Last Sale Date", sale_date or "—")
     k4.metric("Property Type", ptype or "—")
 
-    # Zillow click-out via tracked out-view
-    colZ1, colZ2 = st.columns([2, 8])
-    with colZ1:
-        if st.button("🔎 Track + Zillow"):
-            st.query_params.clear()
-            st.query_params["view"] = "out"
-            st.query_params["pid"] = pid_raw
-            st.query_params["dest"] = "zillow"
-            st.rerun()
-    with colZ2:
-        st.link_button("Zillow (direct link-out, not tracked)", z_url)
+    # Tracked Zillow click (redirects immediately)
+    if st.button("🔎 Track + Open Zillow"):
+        st.query_params.clear()
+        st.query_params["view"] = "out"
+        st.query_params["pid"] = pid_raw
+        st.query_params["dest"] = "zillow"
+        st.rerun()
 
     st.divider()
     st.subheader("Nearby County Comps (cross-check)")
