@@ -1,4 +1,3 @@
-# hennepin_mpls_deal_crawler.py
 import re
 import csv
 import json
@@ -17,7 +16,7 @@ from dateutil import parser as dateparser
 # Global Config
 # =========================
 
-USER_AGENT = "HennepinMplsDealCrawler/1.3 (+public data; polite)"
+USER_AGENT = "HennepinMplsDealCrawler/1.4 (+public data; polite)"
 PAGE_SIZE = 2000
 
 HENNEPIN_LAYER_QUERY_URL = (
@@ -147,18 +146,14 @@ def parse_date_maybe(x: Any) -> Optional[str]:
 
 
 def hennepin_pins_pid_url(pid_any: str) -> str:
-    """
-    Link out to county PINS search using digits-only PID.
-    Works whether pid_any is raw digits or formatted PID.
-    """
     d = digits_only(pid_any)
     return f"https://www16.co.hennepin.mn.us/pins/?articleId=by_pid&pid={d}"
 
 
 @dataclass
 class ParcelLead:
-    pid_raw: str  # digits-only
-    pid: str      # formatted ##-###-##-###-####
+    pid_raw: str
+    pid: str
     owner_name: str
     situs_address: str
     situs_city: str
@@ -177,6 +172,7 @@ class ParcelLead:
     forfeited: bool
     absentee: bool
 
+    # Minneapolis stacking outputs
     mpls_vacant_condemned: bool
     mpls_condemned_date: Optional[str]
     mpls_vbr_type: Optional[str]
@@ -318,29 +314,32 @@ class TableauExtractor:
         return self.bootstrap_df(view_url)
 
 
-def fetch_mpls_tables(enable_mpls: bool, logger: Logger = None) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    if not enable_mpls:
-        return None, None
-
+def fetch_mpls_tables(enable_vbr: bool, enable_viol: bool, logger: Logger = None) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    """
+    Returns (vbr_df, viol_df) but each can be None depending on flags or failures.
+    """
     t = TableauExtractor(logger=logger)
-    vbr = None
-    viol = None
 
-    try:
-        log_msg(logger, "Fetching Minneapolis VBR…")
-        vbr = t.extract(MPLS_VBR_VIEW_URL)
-    except Exception as e:
-        log_msg(logger, f"[WARN] VBR Tableau extract failed: {e}")
+    vbr_df = None
+    viol_df = None
+
+    if enable_vbr:
+        try:
+            log_msg(logger, "Fetching Minneapolis VBR (Vacant/Condemned)…")
+            vbr_df = t.extract(MPLS_VBR_VIEW_URL)
+        except Exception as e:
+            log_msg(logger, f"[WARN] VBR Tableau extract failed: {e}")
 
     polite_sleep(0.5)
 
-    try:
-        log_msg(logger, "Fetching Minneapolis Violations…")
-        viol = t.extract(MPLS_VIOL_VIEW_URL)
-    except Exception as e:
-        log_msg(logger, f"[WARN] Violations Tableau extract failed: {e}")
+    if enable_viol:
+        try:
+            log_msg(logger, "Fetching Minneapolis Violations…")
+            viol_df = t.extract(MPLS_VIOL_VIEW_URL)
+        except Exception as e:
+            log_msg(logger, f"[WARN] Violations Tableau extract failed: {e}")
 
-    return vbr, viol
+    return vbr_df, viol_df
 
 
 # =========================
@@ -433,6 +432,7 @@ def stack_mpls(
     violation_count = 0
     open_violation_count = 0
 
+    # VBR (Vacant/Condemned)
     if vbr_df is not None and not vbr_df.empty:
         cols = infer_vbr_columns(vbr_df)
         idx = match_by_address(
@@ -450,6 +450,7 @@ def stack_mpls(
             if cols.get("vbr_type"):
                 vbr_type = normalize_ws(str(vbr_df.loc[idx, cols["vbr_type"]] or ""))
 
+    # Violations
     if viol_df is not None and not viol_df.empty:
         cols = infer_violation_columns(viol_df)
         addr_col = cols.get("address") or ("Address" if "Address" in viol_df.columns else None)
@@ -548,32 +549,37 @@ def score_lead(
 # Main runner (CSV)
 # =========================
 
-def build_where_clause(cities: Optional[List[str]]) -> str:
+def build_where_clause(cities: Optional[List[str]], property_types: Optional[List[str]]) -> str:
     base = "(EARLIEST_DELQ_YR IS NOT NULL) OR (FORFEIT_LAND_IND = 'Y')"
-    if not cities:
-        return base
-    quoted = ",".join([f"'{c.upper()}'" for c in cities])
-    return f"({base}) AND (UPPER(MUNIC_NM) IN ({quoted}))"
+    parts = [f"({base})"]
+
+    if cities:
+        quoted = ",".join([f"'{c.upper()}'" for c in cities])
+        parts.append(f"(UPPER(MUNIC_NM) IN ({quoted}))")
+
+    if property_types:
+        quoted_pt = ",".join([f"'{p.upper()}'" for p in property_types])
+        parts.append(f"(UPPER(PR_TYP_NM1) IN ({quoted_pt}))")
+
+    return " AND ".join(parts)
 
 
 def run(
     cities: Optional[List[str]],
-    enable_mpls: bool,
+    enable_vbr: bool,
+    enable_viol: bool,
+    property_types: Optional[List[str]],
     top_n: int,
     out_csv: str,
     logger: Logger = None,
 ):
-    where = build_where_clause(cities)
+    where = build_where_clause(cities, property_types)
     log_msg(logger, f"WHERE clause: {where}")
 
     feats = iter_hennepin_features(where=where, out_fields=HENNEPIN_FIELDS, logger=logger)
-    vbr_df, viol_df = fetch_mpls_tables(enable_mpls=enable_mpls, logger=logger)
 
-    if enable_mpls:
-        if vbr_df is None:
-            log_msg(logger, "[WARN] Minneapolis VBR unavailable. Continuing without VBR stacking.")
-        if viol_df is None:
-            log_msg(logger, "[WARN] Minneapolis Violations unavailable. Continuing without violations stacking.")
+    # Fetch only what user enabled
+    vbr_df, viol_df = fetch_mpls_tables(enable_vbr=enable_vbr, enable_viol=enable_viol, logger=logger)
 
     leads: List[ParcelLead] = []
 
@@ -589,10 +595,11 @@ def run(
         yrs_delq = (now_year() - delq_year) if delq_year else None
         forfeited = (str(attrs.get("FORFEIT_LAND_IND") or "").upper() == "Y")
 
-        if enable_mpls and (vbr_df is not None or viol_df is not None):
-            mpls_vacant, condemned_date, vbr_type, vio_cnt, open_vio_cnt = stack_mpls(attrs, vbr_df, viol_df)
-        else:
-            mpls_vacant, condemned_date, vbr_type, vio_cnt, open_vio_cnt = (False, None, None, 0, 0)
+        # If a dataset is disabled, pass None so it contributes nothing
+        vbr_use = vbr_df if enable_vbr else None
+        viol_use = viol_df if enable_viol else None
+
+        mpls_vacant, condemned_date, vbr_type, vio_cnt, open_vio_cnt = stack_mpls(attrs, vbr_use, viol_use)
 
         score, notes = score_lead(attrs, mpls_vacant, condemned_date, vio_cnt, open_vio_cnt)
 
@@ -625,7 +632,7 @@ def run(
     leads.sort(key=lambda x: x.score, reverse=True)
     rows = [asdict(l) for l in leads[:top_n]]
 
-    # Enforce PID format in output + excel-safe column
+    # Enforce PID format in output + excel-safe
     for r in rows:
         r["pid_raw"] = digits_only(r.get("pid_raw", ""))
         r["pid"] = format_pid(r.get("pid_raw") or r.get("pid"))
@@ -645,7 +652,7 @@ def run(
 
 
 # =========================
-# Comparable analysis helpers
+# Comparable analysis helpers (county comps)
 # =========================
 
 def _polygon_centroid(rings: List[List[List[float]]]) -> Optional[Tuple[float, float]]:
@@ -686,9 +693,6 @@ def _arcgis_query(params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def get_parcel_by_pid(pid_any: str) -> Optional[Dict[str, Any]]:
-    """
-    Accepts raw digits or formatted PID. Queries ArcGIS by raw digits.
-    """
     pid_raw = digits_only(pid_any)
     if not pid_raw:
         return None
