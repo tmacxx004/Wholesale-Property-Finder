@@ -1,647 +1,436 @@
-import os
-import tempfile
-import urllib.parse
-from datetime import datetime
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Callable, Optional, Iterable
 
 import pandas as pd
-import streamlit as st
-import streamlit.components.v1 as components
-
-from hennepin_mpls_deal_crawler import (
-    run,
-    hennepin_pins_pid_url,
-    get_parcel_by_pid,
-    get_comps_for_pid,
-    format_pid,
-    digits_only,
-)
-
-from signals_startribune import (
-    NoticeConfig,
-    fetch_startribune_foreclosure_notices,
-    fetch_startribune_probate_notices,
-    merge_notices_into_leads,
-    apply_notice_scoring,
-)
-
-st.set_page_config(page_title="Wholesale Property Finder", layout="wide")
-
-view = (st.query_params.get("view") or "results").strip().lower()
-pid_qp = (st.query_params.get("pid") or "").strip()
-
-default_city_list = [
-    "Minneapolis", "Bloomington", "Brooklyn Park", "Brooklyn Center", "Richfield",
-    "Edina", "St. Louis Park", "Plymouth", "Golden Valley", "Eden Prairie",
-    "Minnetonka", "Hopkins", "Crystal", "New Hope", "Robbinsdale", "Maple Grove",
-]
-
-with st.sidebar:
-    st.header("Search Filters")
-
-    cities = st.multiselect(
-        "Cities/Suburbs (Hennepin MUNIC_NM)",
-        options=default_city_list,
-        default=["Minneapolis"],
-    )
-
-    st.subheader("Minneapolis stacking (optional)")
-    enable_vbr = st.checkbox("Vacant/Condemned (VBR)", value=True)
-    enable_viol = st.checkbox("Violations", value=True)
-
-    st.subheader("Extra distress signals (statewide notices)")
-    enable_mtg_notice = st.checkbox("Mortgage foreclosure notices (Star Tribune)", value=False)
-    enable_probate_notice = st.checkbox("Probate notices (Star Tribune)", value=False)
-
-    notice_limit = st.slider("Notices per source (limit)", 24, 240, 240, 24)
-    notice_age = st.slider("Max notice age (days)", 7, 365, 90, 7)
-
-    top_n = st.slider("Top N leads", 100, 5000, 1000, 100)
-
-    st.divider()
-    st.header("Display")
-    page_size = st.slider("Rows per page", 10, 200, 50, 10)
-    show_debug = st.checkbox("Show debug logs", value=False)
-
-# -------------------------
-# Session State
-# -------------------------
-if "results_df" not in st.session_state:
-    st.session_state.results_df = None
-
-if "property_type_filter_results" not in st.session_state:
-    st.session_state.property_type_filter_results = []
-
-if "probate_crosscheck_filter_results" not in st.session_state:
-    st.session_state.probate_crosscheck_filter_results = []
-
-if "property_type_filter_saved" not in st.session_state:
-    st.session_state.property_type_filter_saved = []
-
-if "saved_pids" not in st.session_state:
-    st.session_state.saved_pids = set()
-
-if "interaction_cache" not in st.session_state:
-    st.session_state.interaction_cache = {}
-
-if "js_open_url" not in st.session_state:
-    st.session_state.js_open_url = ""
-if "js_open_nonce" not in st.session_state:
-    st.session_state.js_open_nonce = 0
+import requests
+from bs4 import BeautifulSoup
 
 
-# -------------------------
-# Helpers
-# -------------------------
-def now_ts() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (WholesalePropertyFinder/1.0; +https://streamlit.io)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+BASE = "https://classifieds.startribune.com"
 
 
-def log_interaction(pid_raw: str, field: str):
-    pid_raw = digits_only(pid_raw)
-    if not pid_raw:
-        return
-    cache = st.session_state.interaction_cache
-    if pid_raw not in cache:
-        cache[pid_raw] = {}
-    cache[pid_raw][field] = now_ts()
+def _now_utc():
+    return datetime.utcnow()
 
 
-def get_interaction(pid_raw: str, field: str) -> str:
-    pid_raw = digits_only(pid_raw)
-    return (st.session_state.interaction_cache.get(pid_raw, {}) or {}).get(field, "")
+def _clean(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
 
-def zillow_search_url(address: str, city: str, state: str, zipc: str) -> str:
-    q = f"{address}, {city}, {state} {zipc}".strip().strip(",")
-    return f"https://www.zillow.com/homes/{urllib.parse.quote_plus(q)}_rb/"
+def _digits_only(s: str) -> str:
+    return re.sub(r"\D+", "", s or "")
 
 
-def _enforce_pid_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    if "pid_raw" in df.columns:
-        df["pid_raw"] = df["pid_raw"].astype(str).map(digits_only)
-        df["pid"] = df["pid_raw"].map(format_pid)
-    return df
+def _norm_addr(s: str) -> str:
+    s = _clean(s).upper()
+    s = s.replace(" AVENUE", " AVE").replace(" STREET", " ST").replace(" ROAD", " RD")
+    s = s.replace(" DRIVE", " DR").replace(" BOULEVARD", " BLVD").replace(" LANE", " LN")
+    s = s.replace(" COURT", " CT").replace(" CIRCLE", " CIR").replace(" PARKWAY", " PKWY")
+    s = re.sub(r"[#,]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
-def _property_type_options(df: pd.DataFrame) -> list[str]:
-    if df is None or df.empty or "property_type" not in df.columns:
-        return []
-    return sorted({str(x).strip() for x in df["property_type"].tolist() if str(x).strip()})
+def _try_parse_sale_date(text: str) -> str:
+    # "DATE AND TIME OF SALE: February 11, 2026 at 10:00 AM"
+    m = re.search(r"DATE\s+AND\s+TIME\s+OF\s+SALE:\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})", text, re.I)
+    if not m:
+        return ""
+    raw = m.group(1)
+    try:
+        dt = datetime.strptime(raw, "%B %d, %Y")
+        return dt.date().isoformat()
+    except Exception:
+        return ""
 
 
-def _apply_property_type_filter(df: pd.DataFrame, selected: list[str]) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    if not selected or "property_type" not in df.columns:
-        return df
-    allowed = {x.strip().upper() for x in selected if x.strip()}
-    d2 = df.copy()
-    d2["_pt"] = d2["property_type"].astype(str).str.strip().str.upper()
-    d2 = d2[d2["_pt"].isin(allowed)].drop(columns=["_pt"])
-    return d2
+def _extract_county(text: str) -> str:
+    m = re.search(r"COUNTY\s+IN\s+WHICH\s+PROPERTY\s+IS\s+LOCATED:\s*([A-Za-z ]+)", text, re.I)
+    return _clean(m.group(1)) if m else ""
 
 
-def _probate_crosscheck_options(df: pd.DataFrame) -> list[str]:
-    if df is None or df.empty or "probate_mail_crosscheck_status" not in df.columns:
-        return []
-    return sorted({str(x).strip() for x in df["probate_mail_crosscheck_status"].tolist() if str(x).strip()})
+def _extract_address(text: str) -> str:
+    # "ADDRESS OF PROPERTY: 1533 Clarence St Saint Paul, MN 55106"
+    m = re.search(r"ADDRESS\s+OF\s+PROPERTY:\s*(.+?)\s+COUNTY\s+IN\s+WHICH", text, re.I)
+    if not m:
+        # alternate phrasing
+        m = re.search(r"MORTGAGED\s+PROPERTY\s+ADDRESS:\s*(.+?)\s+TAX\s+PARCEL", text, re.I)
+    return _clean(m.group(1)) if m else ""
 
 
-def _apply_probate_crosscheck_filter(df: pd.DataFrame, selected: list[str]) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    if not selected or "probate_mail_crosscheck_status" not in df.columns:
-        return df
-    allowed = {x.strip().upper() for x in selected if x.strip()}
-    d2 = df.copy()
-    d2["_pcs"] = d2["probate_mail_crosscheck_status"].astype(str).str.strip().str.upper()
-    d2 = d2[d2["_pcs"].isin(allowed)].drop(columns=["_pcs"])
-    return d2
+def _extract_tax_parcel(text: str) -> str:
+    # "TAX PARCEL NO.: 31-31-23-42-0048"
+    m = re.search(r"TAX\s+PARCEL\s+(?:NO\.?|NO|I\.D\.)\s*[:#]?\s*([0-9A-Za-z\-]+)", text, re.I)
+    return _clean(m.group(1)) if m else ""
 
 
-def _header_nav():
-    left, mid, right = st.columns([2, 2, 6])
-    with left:
-        if st.button("📋 Results", use_container_width=True):
-            st.query_params.clear()
-            st.query_params["view"] = "results"
-            st.rerun()
-    with mid:
-        if st.button("⭐ Saved", use_container_width=True):
-            st.query_params.clear()
-            st.query_params["view"] = "saved"
-            st.rerun()
-    with right:
-        st.caption("Sources show as badges. Zillow opens new tab without leaving Results; clicks are timestamped.")
+def _extract_probate_file(text: str) -> str:
+    m = re.search(r"Court\s+File\s+No\.?\s*[:#]?\s*([0-9A-Za-z\-]+)", text, re.I)
+    return _clean(m.group(1)) if m else ""
 
 
-def _save_toggle(pid_raw: str) -> bool:
-    pid_raw = digits_only(pid_raw)
-    if not pid_raw:
+def _extract_decedent(text: str) -> str:
+    m = re.search(r"Estate\s+of\s+(.+?),\s*Decedent", text, re.I)
+    return _clean(m.group(1)) if m else ""
+
+
+def _extract_probate_rep_address(text: str) -> str:
+    patterns = [
+        r"\bAddress:\s*(.+?)(?:\bName\b|\bTelephone\b|\bAttorney\b|\bDated\b|$)",
+        r"\bMailing\s+Address:\s*(.+?)(?:\bName\b|\bTelephone\b|\bAttorney\b|\bDated\b|$)",
+        r"\bAddress\s+of\s+Personal\s+Representative:\s*(.+?)(?:\bName\b|\bTelephone\b|\bAttorney\b|\bDated\b|$)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            return _clean(m.group(1))
+    return ""
+
+
+def _abs_url(href: str) -> str:
+    href = (href or "").strip()
+    if not href:
+        return ""
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    if href.startswith("/"):
+        return BASE + href
+    return BASE + "/" + href
+
+
+def _extract_ad_links(listing_html: str, must_contain: str) -> list[str]:
+    soup = BeautifulSoup(listing_html, "lxml")
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if must_contain in href:
+            links.append(_abs_url(href))
+    # de-dupe preserving order
+    seen = set()
+    out = []
+    for u in links:
+        if u and u not in seen:
+            out.append(u)
+            seen.add(u)
+    return out
+
+
+def _city_in_text(city: str, text: str) -> bool:
+    city = _clean(city).upper()
+    text = _clean(text).upper()
+    if not city or not text:
         return False
-    if pid_raw in st.session_state.saved_pids:
-        st.session_state.saved_pids.remove(pid_raw)
-        log_interaction(pid_raw, "unsaved_at")
-        return False
-    else:
-        st.session_state.saved_pids.add(pid_raw)
-        log_interaction(pid_raw, "saved_at")
-        return True
+    # requires word boundary-ish match
+    return re.search(rf"\b{re.escape(city)}\b", text) is not None
 
 
-def _queue_js_open(url: str):
-    st.session_state.js_open_url = url
-    st.session_state.js_open_nonce += 1
+@dataclass
+class NoticeConfig:
+    limit: int = 120          # number of ad detail pages to process
+    max_age_days: int = 120
+    sleep_s: float = 0.2
 
 
-def _flush_js_open():
-    url = st.session_state.get("js_open_url", "")
-    nonce = st.session_state.get("js_open_nonce", 0)
-    if not url:
-        return
-    components.html(
-        f"""
-        <script>
-          (function() {{
-            const url = {url!r};
-            window.open(url, "_blank", "noopener,noreferrer");
-          }})();
-        </script>
-        <div style="display:none">nonce:{nonce}</div>
-        """,
-        height=0,
-    )
-    st.session_state.js_open_url = ""
+def fetch_startribune_foreclosure_notices(
+    cfg: NoticeConfig,
+    *,
+    cities: Optional[Iterable[str]] = None,
+    county_filter: Optional[str] = "HENNEPIN",
+    logger: Optional[Callable[[str], None]] = None,
+) -> pd.DataFrame:
+    """
+    Robust approach:
+      1) fetch the listing page
+      2) extract individual notice/ad links
+      3) fetch each ad page and parse full notice body
 
+    Returns signals that can match by PID guess or normalized address.
+    """
+    list_url = f"{BASE}/mn/foreclosures/search?limit=240"
+    if logger:
+        logger(f"[StarTribune] Foreclosures listing: {list_url}")
 
-def _compute_source_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    d = df.copy()
+    r = requests.get(list_url, headers=DEFAULT_HEADERS, timeout=30)
+    r.raise_for_status()
 
-    def sources_for_row(r) -> list[str]:
-        sources = ["Hennepin County"]
-        if bool(r.get("mpls_vacant_condemned", False)):
-            sources.append("MPLS VBR")
+    ad_links = _extract_ad_links(r.text, must_contain="notice-of-mortgage-foreclosure-sale")
+    if logger:
+        logger(f"[StarTribune] Foreclosures ad links found: {len(ad_links)}")
+
+    # cap
+    ad_links = ad_links[: max(1, cfg.limit)]
+
+    cutoff = _now_utc().date() - timedelta(days=cfg.max_age_days)
+
+    out = []
+    cities_list = [c for c in (cities or []) if _clean(c)]
+    county_filter_u = _clean(county_filter).upper() if county_filter else ""
+
+    for i, url in enumerate(ad_links, start=1):
         try:
-            if int(r.get("mpls_open_violation_count", 0) or 0) > 0:
-                sources.append("MPLS Violations")
-        except Exception:
-            pass
-        if bool(r.get("has_mortgage_foreclosure_notice", False)):
-            sources.append("Foreclosure Notice")
-        if bool(r.get("has_probate_notice", False)):
-            sources.append("Probate Notice")
-        return sources
+            rr = requests.get(url, headers=DEFAULT_HEADERS, timeout=30)
+            rr.raise_for_status()
+            soup = BeautifulSoup(rr.text, "lxml")
 
-    d["sources_found"] = d.apply(sources_for_row, axis=1)
-    d["sources_found_text"] = d["sources_found"].map(lambda xs: " | ".join(xs) if isinstance(xs, list) else str(xs))
-    return d
+            # pull full page text (ad detail page has full body)
+            text = _clean(soup.get_text(" "))
 
+            county = _extract_county(text)
+            addr = _extract_address(text)
+            tax_parcel = _extract_tax_parcel(text)
+            sale_date = _try_parse_sale_date(text)
 
-def _render_source_badges(sources: list[str]):
-    if not sources:
-        return
-    badge_map = {
-        "Hennepin County": "🏛️ Hennepin",
-        "MPLS VBR": "🏚️ VBR",
-        "MPLS Violations": "🧾 Violations",
-        "Foreclosure Notice": "🚨 Foreclosure",
-        "Probate Notice": "⚖️ Probate",
-    }
-    tags = [badge_map.get(s, s) for s in sources]
-    st.caption("  •  ".join(tags))
+            if not addr:
+                continue
 
+            # county filter (Hennepin by default)
+            if county_filter_u and county_filter_u not in _clean(county).upper():
+                # allow fallback by city match if county isn't extractable
+                if cities_list and not any(_city_in_text(c, addr) for c in cities_list):
+                    continue
 
-def _filter_by_selected_extra_distress_signals(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    NEW behavior:
-    If the user selects ANY 'Extra distress signals' option(s),
-    then only keep properties that match at least one selected signal.
-      - Mortgage foreclosure notices -> has_mortgage_foreclosure_notice
-      - Probate notices -> has_probate_notice
-    """
-    if df is None or df.empty:
-        return df
-
-    selected_masks = []
-
-    if enable_mtg_notice:
-        m = df.get("has_mortgage_foreclosure_notice", pd.Series([False] * len(df)))
-        selected_masks.append(m.fillna(False).astype(bool))
-
-    if enable_probate_notice:
-        m = df.get("has_probate_notice", pd.Series([False] * len(df)))
-        selected_masks.append(m.fillna(False).astype(bool))
-
-    # If none selected, do not restrict results
-    if not selected_masks:
-        return df
-
-    # OR logic across selected signals: keep rows that match ANY selected signal
-    mask = selected_masks[0]
-    for m in selected_masks[1:]:
-        mask = mask | m
-
-    return df.loc[mask].copy()
-
-
-def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True):
-    pid_raw = digits_only(str(row.get("pid_raw", "")).strip())
-    pid_fmt = format_pid(pid_raw)
-
-    addr = str(row.get("situs_address", "")).strip()
-    city = str(row.get("situs_city", "")).strip()
-    zipc = str(row.get("situs_zip", "")).strip()
-    owner = str(row.get("owner_name", "")).strip()
-    score = row.get("score", "")
-    notes = str(row.get("score_notes", ""))
-    ptype = str(row.get("property_type", "")).strip()
-
-    county_url = hennepin_pins_pid_url(pid_raw)
-
-    z_clicked = get_interaction(pid_raw, "zillow_clicked_at")
-    c_opened = get_interaction(pid_raw, "comps_opened_at")
-    saved_at = get_interaction(pid_raw, "saved_at")
-    is_saved = pid_raw in st.session_state.saved_pids
-
-    z_url = zillow_search_url(addr, city, "MN", zipc)
-
-    sources = row.get("sources_found", [])
-    if isinstance(sources, str):
-        sources = [s.strip() for s in sources.split("|") if s.strip()]
-
-    fc_url = str(row.get("foreclosure_notice_url", "")).strip()
-    pb_url = str(row.get("probate_notice_url", "")).strip()
-
-    pcs = str(row.get("probate_mail_crosscheck_status", "")).strip()
-
-    with st.container(border=True):
-        c1, c2, c3, c4, c5, c6 = st.columns([6, 2, 1, 1, 1, 1])
-
-        with c1:
-            st.markdown(f"### {addr}, {city} {zipc}")
-            st.write(f"**PID:** {pid_fmt}  •  **Type:** {ptype or '—'}  •  **Owner:** {owner}")
-            _render_source_badges(sources)
-
-            if bool(row.get("has_probate_notice", False)):
-                st.caption(f"🔍 Probate cross-check (mailing city vs notice address): **{pcs or 'No data'}**")
-
-            st.write(f"**Score:** {score}  •  {notes}")
-
-            meta = []
-            if z_clicked:
-                meta.append(f"🔎 Zillow clicked: {z_clicked}")
-            if c_opened:
-                meta.append(f"📊 Comps opened: {c_opened}")
-            if saved_at:
-                meta.append(f"⭐ Saved: {saved_at}")
-            if meta:
-                st.caption(" | ".join(meta))
-
-            link_row = []
-            if fc_url:
-                link_row.append(("Foreclosure source", fc_url))
-            if pb_url:
-                link_row.append(("Probate source", pb_url))
-            if link_row:
-                st.caption(" • ".join([f"[{t}]({u})" for t, u in link_row]))
-
-        with c2:
-            st.write(f"**Market Value:** {row.get('market_value_total', '')}")
-            st.write(f"**Last Sale:** {row.get('sale_date_raw', '')}")
-            st.write(f"**Sale Price:** {row.get('sale_price', '')}")
-
-        with c3:
-            st.link_button("🏛️", county_url, help="Open Hennepin County property search (PID)")
-
-        with c4:
-            if st.button("🔎", key=f"z_{idx_key}", help="Open Zillow (new tab) and log timestamp"):
-                log_interaction(pid_raw, "zillow_clicked_at")
-                _queue_js_open(z_url)
-                st.rerun()
-
-        with c5:
-            if st.button("📊", key=f"c_{idx_key}", help="Open comparable analysis (tracked)"):
-                log_interaction(pid_raw, "comps_opened_at")
-                st.query_params.clear()
-                st.query_params["view"] = "comps"
-                st.query_params["pid"] = pid_raw
-                st.rerun()
-
-        with c6:
-            if allow_save:
-                label = "★" if is_saved else "☆"
-                help_txt = "Unsave" if is_saved else "Save to list"
-                if st.button(label, key=f"s_{idx_key}", help=help_txt):
-                    _save_toggle(pid_raw)
-                    st.rerun()
-
-
-def _apply_notice_sources(df: pd.DataFrame):
-    if df is None or df.empty:
-        return df
-
-    cfg = NoticeConfig(limit=notice_limit, max_age_days=notice_age, sleep_s=0.25)
-
-    def log(msg: str):
-        if show_debug:
-            st.write(msg)
-
-    forecl_df = pd.DataFrame()
-    probate_df = pd.DataFrame()
-
-    if enable_mtg_notice:
-        with st.spinner("Pulling mortgage foreclosure notices…"):
-            forecl_df = fetch_startribune_foreclosure_notices(cfg, logger=log)
-
-    if enable_probate_notice:
-        with st.spinner("Pulling probate notices…"):
-            probate_df = fetch_startribune_probate_notices(cfg, logger=log)
-
-    if (forecl_df is None or forecl_df.empty) and (probate_df is None or probate_df.empty):
-        return df
-
-    merged = merge_notices_into_leads(df, forecl_df, probate_df)
-    merged = apply_notice_scoring(merged)
-    return merged
-
-
-def render_results():
-    st.title("Wholesale Property Finder — Hennepin County MN")
-    st.caption("If you select any extra distress signal, results will only show properties that match those signals.")
-
-    _header_nav()
-    _flush_js_open()
-
-    run_btn = st.button("Run crawler", type="primary")
-
-    if run_btn:
-        def log(msg: str):
-            if show_debug:
-                st.write(msg)
-
-        with st.spinner("Running…"):
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
-            tmp.close()
-            try:
-                run(
-                    cities=cities if cities else None,
-                    enable_vbr=enable_vbr,
-                    enable_viol=enable_viol,
-                    property_types=None,
-                    top_n=top_n,
-                    out_csv=tmp.name,
-                    logger=log,
-                )
-                df = pd.read_csv(tmp.name, dtype={"pid": "string", "pid_raw": "string"}, keep_default_na=False)
-            finally:
+            # age filter (based on sale date if present)
+            if sale_date:
                 try:
-                    os.unlink(tmp.name)
+                    sd = datetime.fromisoformat(sale_date).date()
+                    if sd < cutoff:
+                        continue
                 except Exception:
                     pass
 
-        df = _enforce_pid_columns(df)
-        df = _apply_notice_sources(df)
-        df = _compute_source_indicators(df)
+            # optional city filter for relevance
+            if cities_list and not any(_city_in_text(c, addr) for c in cities_list):
+                # don’t hard fail; some notices omit the city in the captured segment
+                # but in practice address includes city, so this is a good filter.
+                continue
 
-        # ✅ NEW: if any extra distress signal is selected, restrict results to matching properties
-        df = _filter_by_selected_extra_distress_signals(df)
+            pid_raw_guess = _digits_only(tax_parcel)
+            norm_key = _norm_addr(addr)
 
-        st.session_state.results_df = df
-        st.session_state.property_type_filter_results = []
-        st.session_state.probate_crosscheck_filter_results = []
+            out.append(
+                {
+                    "signal_name": "mortgage_foreclosure_notice",
+                    "source_url": url,          # direct ad link (better audit than listing)
+                    "event_date": sale_date,
+                    "county": county,
+                    "address_text": addr,
+                    "tax_parcel_text": tax_parcel,
+                    "pid_raw_guess": pid_raw_guess,
+                    "norm_key": norm_key,
+                    "signal_strength": 35,
+                    "signal_details": f"Foreclosure notice; sale_date={sale_date or 'unknown'}; county={county or 'unknown'}",
+                }
+            )
 
-    df = st.session_state.results_df
-    if df is None:
-        st.info("Click **Run crawler** to generate results.")
-        return
-    if df.empty:
-        st.warning("No results returned with the current selections.")
-        st.caption("Tip: If you selected foreclosure/probate signals, results only include matching properties.")
-        return
+            time.sleep(cfg.sleep_s)
 
-    # -------------------------
-    # Post-search filters (STATIC HEADER ABOVE RESULTS)
-    # -------------------------
-    st.markdown("## Post-search Filters")
+        except Exception as e:
+            if logger:
+                logger(f"[StarTribune] Foreclosure ad failed ({i}/{len(ad_links)}): {url} :: {type(e).__name__}")
+            continue
 
-    pt_options = _property_type_options(df)
-    if pt_options:
-        st.session_state.property_type_filter_results = [
-            x for x in st.session_state.property_type_filter_results if x in pt_options
-        ]
-        st.session_state.property_type_filter_results = st.multiselect(
-            "Property type (values from this search only)",
-            options=pt_options,
-            default=st.session_state.property_type_filter_results,
-        )
-    else:
-        st.caption("No property_type values available for filtering.")
-
-    pcs_options = _probate_crosscheck_options(df)
-    if pcs_options:
-        st.session_state.probate_crosscheck_filter_results = [
-            x for x in st.session_state.probate_crosscheck_filter_results if x in pcs_options
-        ]
-        st.session_state.probate_crosscheck_filter_results = st.multiselect(
-            "Cross-check decedent vs owner mailing address (status from this search only)",
-            options=pcs_options,
-            default=st.session_state.probate_crosscheck_filter_results,
-            help="Match means owner mailing city appears in the probate notice representative address (best available cross-check).",
-        )
-    else:
-        st.caption("No probate cross-check statuses available (enable Probate notices to populate).")
-
-    df_ui = df
-    df_ui = _apply_property_type_filter(df_ui, st.session_state.property_type_filter_results)
-    df_ui = _apply_probate_crosscheck_filter(df_ui, st.session_state.probate_crosscheck_filter_results)
-
-    st.divider()
-
-    if df_ui.empty:
-        st.warning("No results after applying post-search filters.")
-        return
-
-    st.download_button(
-        "Download CSV (filtered)",
-        df_ui.to_csv(index=False).encode("utf-8"),
-        "ranked_leads_filtered.csv",
-        "text/csv",
-    )
-
-    st.subheader("Results")
-
-    total = len(df_ui)
-    total_pages = max(1, (total + page_size - 1) // page_size)
-    page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
-    start = (page - 1) * page_size
-    end = min(total, start + page_size)
-    slice_df = df_ui.iloc[start:end].copy()
-
-    st.caption(f"Showing rows {start+1:,}–{end:,} of {total:,}")
-
-    for i, row in slice_df.iterrows():
-        _render_property_card(row, idx_key=f"r_{i}", allow_save=True)
+    return pd.DataFrame(out)
 
 
-def render_saved():
-    st.title("⭐ Saved Properties")
-    _header_nav()
-    _flush_js_open()
+def fetch_startribune_probate_notices(
+    cfg: NoticeConfig,
+    *,
+    logger: Optional[Callable[[str], None]] = None,
+) -> pd.DataFrame:
+    """
+    Similar robust approach: listing -> ad links -> parse ad pages.
+    """
+    list_url = f"{BASE}/mn/sub-probates/search?limit=240"
+    if logger:
+        logger(f"[StarTribune] Probates listing: {list_url}")
 
-    saved = sorted(st.session_state.saved_pids)
-    if not saved:
-        st.info("Your saved list is empty. Go to Results and click ☆ to save properties.")
-        return
+    r = requests.get(list_url, headers=DEFAULT_HEADERS, timeout=30)
+    r.raise_for_status()
 
-    df = st.session_state.results_df
-    if df is None or df.empty:
-        st.warning("No results are loaded yet. Run the crawler first so the app can display saved details.")
-        st.write(saved)
-        return
+    # probate URLs vary; keep it broad
+    ad_links = _extract_ad_links(r.text, must_contain="/probate")
+    if logger:
+        logger(f"[StarTribune] Probate ad links found: {len(ad_links)}")
 
-    df = _enforce_pid_columns(df)
-    df_saved = df[df["pid_raw"].isin(saved)].copy()
+    ad_links = ad_links[: max(1, cfg.limit)]
 
-    if df_saved.empty:
-        st.warning("None of your saved PIDs are in the currently loaded results.")
-        st.write(saved)
-        return
+    out = []
+    for i, url in enumerate(ad_links, start=1):
+        try:
+            rr = requests.get(url, headers=DEFAULT_HEADERS, timeout=30)
+            rr.raise_for_status()
+            soup = BeautifulSoup(rr.text, "lxml")
+            text = _clean(soup.get_text(" "))
 
-    st.download_button(
-        "Download CSV (saved)",
-        df_saved.to_csv(index=False).encode("utf-8"),
-        "saved_properties.csv",
-        "text/csv",
-    )
+            decedent = _extract_decedent(text)
+            if not decedent:
+                # some probates might not follow same phrase; skip quietly
+                continue
 
-    st.subheader(f"Saved ({len(df_saved):,})")
+            court_file = _extract_probate_file(text)
+            rep_addr = _extract_probate_rep_address(text)
 
-    total = len(df_saved)
-    total_pages = max(1, (total + page_size - 1) // page_size)
-    page = st.number_input("Page (Saved)", min_value=1, max_value=total_pages, value=1, step=1)
-    start = (page - 1) * page_size
-    end = min(total, start + page_size)
-    slice_df = df_saved.iloc[start:end].copy()
+            out.append(
+                {
+                    "signal_name": "probate_notice",
+                    "source_url": url,
+                    "event_date": "",
+                    "court_file_no": court_file,
+                    "decedent_name": decedent,
+                    "rep_address_text": rep_addr,
+                    "norm_decedent": _clean(decedent).upper(),
+                    "signal_strength": 25,
+                    "signal_details": f"Probate notice; court_file={court_file or 'unknown'}; decedent={decedent}",
+                }
+            )
 
-    st.caption(f"Showing rows {start+1:,}–{end:,} of {total:,}")
+            time.sleep(cfg.sleep_s)
 
-    for i, row in slice_df.iterrows():
-        _render_property_card(row, idx_key=f"sv_{i}", allow_save=True)
+        except Exception as e:
+            if logger:
+                logger(f"[StarTribune] Probate ad failed ({i}/{len(ad_links)}): {url} :: {type(e).__name__}")
+            continue
 
-
-def render_comps(pid_any: str):
-    pid_raw = digits_only(pid_any)
-    pid_fmt = format_pid(pid_raw)
-
-    st.title("Comparable Analysis (County + Zillow link)")
-    _header_nav()
-
-    colA, colB, _ = st.columns([2, 2, 8])
-    with colA:
-        st.link_button("🏛️ County Property Page", hennepin_pins_pid_url(pid_raw))
-    with colB:
-        if st.button("⬅️ Back to Results"):
-            st.query_params.clear()
-            st.query_params["view"] = "results"
-            st.rerun()
-
-    if not pid_raw:
-        st.warning("No PID provided. Go back to Results and click 📊 on a property.")
-        return
-
-    with st.spinner("Loading county parcel…"):
-        subj = get_parcel_by_pid(pid_raw)
-
-    if subj is None:
-        st.error("Could not load the subject property from the parcel service.")
-        return
-
-    addr = subj.get("situs_address", "")
-    city = subj.get("situs_city", "")
-    zipc = subj.get("situs_zip", "")
-    z_url = zillow_search_url(addr, city, "MN", zipc)
-
-    st.subheader(f"{addr}, {city} {zipc}")
-    st.write(f"**PID:** {pid_fmt}")
-
-    if st.button("🔎 Open Zillow (tracked, new tab)"):
-        log_interaction(pid_raw, "zillow_clicked_at")
-        _queue_js_open(z_url)
-        st.rerun()
-
-    st.divider()
-    st.subheader("Nearby County Comps")
-
-    c1, c2, c3, _ = st.columns([2, 2, 2, 4])
-    with c1:
-        radius_m = st.slider("Radius (meters)", 200, 2000, 800, 100)
-    with c2:
-        max_comps = st.slider("Max comps", 5, 50, 15, 1)
-    with c3:
-        value_band = st.slider("County value band (+/- %)", 10, 80, 30, 5)
-
-    with st.spinner("Finding county comps…"):
-        comps_df = get_comps_for_pid(
-            pid_any=pid_raw,
-            radius_m=radius_m,
-            max_comps=max_comps,
-            value_band_pct=value_band,
-        )
-
-    if comps_df is None or comps_df.empty:
-        st.warning("No county comps found with current filters.")
-        return
-
-    st.dataframe(comps_df, use_container_width=True)
+    return pd.DataFrame(out)
 
 
-if view == "saved":
-    render_saved()
-elif view == "comps":
-    render_comps(pid_qp)
-else:
-    render_results()
+def merge_notices_into_leads(
+    leads_df: pd.DataFrame,
+    forecl_df: pd.DataFrame,
+    probate_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Foreclosure match:
+      1) PID guess match (only works when it aligns with your pid_raw format)
+      2) else normalized situs address match
+
+    Probate match:
+      owner_name contains decedent last name (heuristic)
+      cross-check status uses owner mailing city vs notice rep address text
+    """
+    df = leads_df.copy()
+
+    # Ensure pid_raw
+    if "pid_raw" not in df.columns:
+        df["pid_raw"] = df.get("pid", "").astype(str).map(_digits_only)
+    df["pid_raw"] = df["pid_raw"].astype(str).map(_digits_only)
+
+    # Normalized situs key
+    df["_norm_addr_key"] = df.get("situs_address", "").astype(str).map(_norm_addr)
+
+    # Foreclosure fields
+    df["has_mortgage_foreclosure_notice"] = False
+    df["foreclosure_sale_date"] = ""
+    df["foreclosure_notice_url"] = ""
+    df["foreclosure_notice_details"] = ""
+
+    if forecl_df is not None and not forecl_df.empty:
+        f = forecl_df.copy()
+        f["pid_raw_guess"] = f.get("pid_raw_guess", "").astype(str).map(_digits_only)
+        f["_norm_addr_key"] = f.get("norm_key", "").astype(str)
+
+        # PID match (often won’t match Hennepin PID; address is the real win)
+        pid_hits = f[f["pid_raw_guess"].astype(bool)].drop_duplicates(subset=["pid_raw_guess"])
+        pid_map = pid_hits.set_index("pid_raw_guess").to_dict(orient="index") if not pid_hits.empty else {}
+
+        hit_mask = df["pid_raw"].isin(pid_map.keys())
+        df.loc[hit_mask, "has_mortgage_foreclosure_notice"] = True
+        df.loc[hit_mask, "foreclosure_sale_date"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("event_date", ""))
+        df.loc[hit_mask, "foreclosure_notice_url"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("source_url", ""))
+        df.loc[hit_mask, "foreclosure_notice_details"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("signal_details", ""))
+
+        # Address match (primary)
+        addr_hits = f[f["_norm_addr_key"].astype(bool)].drop_duplicates(subset=["_norm_addr_key"])
+        addr_map = addr_hits.set_index("_norm_addr_key").to_dict(orient="index") if not addr_hits.empty else {}
+
+        hit_mask2 = df["_norm_addr_key"].isin(addr_map.keys()) & (~df["has_mortgage_foreclosure_notice"])
+        df.loc[hit_mask2, "has_mortgage_foreclosure_notice"] = True
+        df.loc[hit_mask2, "foreclosure_sale_date"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("event_date", ""))
+        df.loc[hit_mask2, "foreclosure_notice_url"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("source_url", ""))
+        df.loc[hit_mask2, "foreclosure_notice_details"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("signal_details", ""))
+
+    # Probate fields
+    df["has_probate_notice"] = False
+    df["probate_court_file_no"] = ""
+    df["probate_decedent_name"] = ""
+    df["probate_rep_address_text"] = ""
+    df["probate_notice_url"] = ""
+    df["probate_notice_details"] = ""
+    df["probate_mail_crosscheck_status"] = "No data"
+
+    if probate_df is not None and not probate_df.empty and "owner_name" in df.columns:
+        p = probate_df.copy()
+        p["norm_decedent"] = p.get("norm_decedent", "").astype(str)
+        p["decedent_last"] = p["norm_decedent"].map(lambda x: x.split()[-1] if x else "")
+        p = p[p["decedent_last"].astype(bool)]
+
+        last_map = p.drop_duplicates(subset=["decedent_last"]).set_index("decedent_last").to_dict(orient="index")
+
+        def _find_probate(owner: str):
+            owner = _clean(owner).upper()
+            for last, rec in last_map.items():
+                if last and last in owner:
+                    return rec
+            return None
+
+        recs = df["owner_name"].astype(str).str.upper().map(_find_probate)
+
+        df["has_probate_notice"] = recs.notna()
+        df.loc[df["has_probate_notice"], "probate_court_file_no"] = recs[df["has_probate_notice"]].map(lambda r: (r or {}).get("court_file_no", ""))
+        df.loc[df["has_probate_notice"], "probate_decedent_name"] = recs[df["has_probate_notice"]].map(lambda r: (r or {}).get("decedent_name", ""))
+        df.loc[df["has_probate_notice"], "probate_rep_address_text"] = recs[df["has_probate_notice"]].map(lambda r: (r or {}).get("rep_address_text", ""))
+        df.loc[df["has_probate_notice"], "probate_notice_url"] = recs[df["has_probate_notice"]].map(lambda r: (r or {}).get("source_url", ""))
+        df.loc[df["has_probate_notice"], "probate_notice_details"] = recs[df["has_probate_notice"]].map(lambda r: (r or {}).get("signal_details", ""))
+
+        # cross-check: owner mailing city vs probate rep address text
+        mail_city = df.get("mailing_city", pd.Series([""] * len(df))).astype(str).str.upper()
+        rep_addr = df["probate_rep_address_text"].astype(str).str.upper()
+
+        statuses = []
+        for has_pb, mc, ra in zip(df["has_probate_notice"].tolist(), mail_city.tolist(), rep_addr.tolist()):
+            mc = _clean(mc).upper()
+            ra = _clean(ra).upper()
+            if not has_pb or not mc or not ra:
+                statuses.append("No data")
+            else:
+                statuses.append("Match" if re.search(rf"\b{re.escape(mc)}\b", ra) else "Mismatch")
+        df["probate_mail_crosscheck_status"] = statuses
+
+    df.drop(columns=["_norm_addr_key"], errors="ignore", inplace=True)
+    return df
+
+
+def apply_notice_scoring(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    if "score" not in d.columns:
+        d["score"] = 0
+    if "score_notes" not in d.columns:
+        d["score_notes"] = ""
+
+    def add_note(cur: str, note: str) -> str:
+        cur = (cur or "").strip()
+        if not cur:
+            return note
+        if note in cur:
+            return cur
+        return cur + " | " + note
+
+    if "has_mortgage_foreclosure_notice" in d.columns:
+        mask = d["has_mortgage_foreclosure_notice"].fillna(False)
+        d.loc[mask, "score"] = pd.to_numeric(d.loc[mask, "score"], errors="coerce").fillna(0) + 35
+        d.loc[mask, "score_notes"] = d.loc[mask, "score_notes"].map(lambda s: add_note(s, "Mortgage foreclosure notice"))
+
+    if "has_probate_notice" in d.columns:
+        mask = d["has_probate_notice"].fillna(False)
+        d.loc[mask, "score"] = pd.to_numeric(d.loc[mask, "score"], errors="coerce").fillna(0) + 25
+        d.loc[mask, "score_notes"] = d.loc[mask, "score_notes"].map(lambda s: add_note(s, "Probate notice (heuristic match)"))
+
+    return d
