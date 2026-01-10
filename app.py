@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import urllib.parse
 from datetime import datetime
@@ -26,15 +27,9 @@ from signals_startribune import (
 
 st.set_page_config(page_title="Wholesale Property Finder", layout="wide")
 
-# -------------------------
-# Router via query params
-# -------------------------
 view = (st.query_params.get("view") or "results").strip().lower()
 pid_qp = (st.query_params.get("pid") or "").strip()
 
-# -------------------------
-# Sidebar inputs
-# -------------------------
 default_city_list = [
     "Minneapolis", "Bloomington", "Brooklyn Park", "Brooklyn Center", "Richfield",
     "Edina", "St. Louis Park", "Plymouth", "Golden Valley", "Eden Prairie",
@@ -54,14 +49,14 @@ with st.sidebar:
     enable_vbr = st.checkbox("Vacant/Condemned (VBR)", value=True)
     enable_viol = st.checkbox("Violations", value=True)
 
-    st.subheader("Extra distress signals (statewide notices)")
-    enable_mtg_notice = st.checkbox("Mortgage foreclosure notices (Star Tribune)", value=False)
-    enable_probate_notice = st.checkbox("Probate notices (Star Tribune)", value=False)
+    st.subheader("Extra distress signals (Star Tribune)")
+    enable_mtg_notice = st.checkbox("Mortgage foreclosure notices", value=False)
+    enable_probate_notice = st.checkbox("Probate notices", value=False)
 
     notice_limit = st.slider("Notices per source (limit)", 24, 240, 120, 24)
     notice_age = st.slider("Max notice age (days)", 7, 365, 120, 7)
 
-    top_n = st.slider("Top N leads", 100, 5000, 1000, 100)
+    top_n = st.slider("Top N Hennepin leads", 100, 5000, 1000, 100)
 
     st.divider()
     st.header("Display")
@@ -69,7 +64,7 @@ with st.sidebar:
     show_debug = st.checkbox("Show debug logs", value=False)
 
 # -------------------------
-# Session state
+# Session State
 # -------------------------
 if "results_df" not in st.session_state:
     st.session_state.results_df = None
@@ -177,7 +172,7 @@ def _header_nav():
             st.query_params["view"] = "saved"
             st.rerun()
     with right:
-        st.caption("Sources show as badges. Zillow opens in a new tab without leaving Results; clicks are timestamped.")
+        st.caption("Distress signals are shown even if they don't match county parcels (city match).")
 
 
 def _save_toggle(pid_raw: str) -> bool:
@@ -225,9 +220,12 @@ def _compute_source_indicators(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
 
     def sources_for_row(r) -> list[str]:
-        sources = ["Hennepin County"]
+        sources = []
+        if bool(r.get("is_notice_only", False)):
+            sources.append("StarTribune")
+        else:
+            sources.append("Hennepin County")
 
-        # Minneapolis signals from your crawler (if present)
         if bool(r.get("mpls_vacant_condemned", False)):
             sources.append("MPLS VBR")
         try:
@@ -236,7 +234,6 @@ def _compute_source_indicators(df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             pass
 
-        # Notice sources
         if bool(r.get("has_mortgage_foreclosure_notice", False)):
             sources.append("Foreclosure Notice")
         if bool(r.get("has_probate_notice", False)):
@@ -245,7 +242,6 @@ def _compute_source_indicators(df: pd.DataFrame) -> pd.DataFrame:
         return sources
 
     d["sources_found"] = d.apply(sources_for_row, axis=1)
-    d["sources_found_text"] = d["sources_found"].map(lambda xs: " | ".join(xs) if isinstance(xs, list) else str(xs))
     return d
 
 
@@ -254,6 +250,7 @@ def _render_source_badges(sources: list[str]):
         return
     badge_map = {
         "Hennepin County": "🏛️ Hennepin",
+        "StarTribune": "📰 StarTribune",
         "MPLS VBR": "🏚️ VBR",
         "MPLS Violations": "🧾 Violations",
         "Foreclosure Notice": "🚨 Foreclosure",
@@ -263,40 +260,118 @@ def _render_source_badges(sources: list[str]):
     st.caption("  •  ".join(tags))
 
 
-def _filter_by_selected_extra_distress_signals(df: pd.DataFrame) -> pd.DataFrame:
+def _filter_by_selected_extra_distress_signals_OR(df: pd.DataFrame) -> pd.DataFrame:
     """
-    If the user selects ANY 'Extra distress signals' option(s),
-    then only keep properties that match at least one selected signal.
-      - Mortgage foreclosure notices -> has_mortgage_foreclosure_notice
-      - Probate notices -> has_probate_notice
+    OR logic:
+      - if foreclosure selected -> keep foreclosure rows
+      - if probate selected -> keep probate rows
+      - if both selected -> keep (foreclosure OR probate)
+      - if neither selected -> no restriction
     """
     if df is None or df.empty:
         return df
 
     masks = []
-
     if enable_mtg_notice:
-        m = df.get("has_mortgage_foreclosure_notice", pd.Series([False] * len(df)))
-        masks.append(m.fillna(False).astype(bool))
-
+        masks.append(df.get("has_mortgage_foreclosure_notice", pd.Series([False] * len(df))).fillna(False).astype(bool))
     if enable_probate_notice:
-        m = df.get("has_probate_notice", pd.Series([False] * len(df)))
-        masks.append(m.fillna(False).astype(bool))
+        masks.append(df.get("has_probate_notice", pd.Series([False] * len(df))).fillna(False).astype(bool))
 
-    # none selected => no restriction
     if not masks:
         return df
 
-    mask = masks[0]
-    for m in masks[1:]:
-        mask = mask | m
+    m = masks[0]
+    for mm in masks[1:]:
+        m = m | mm
+    return df.loc[m].copy()
 
-    return df.loc[mask].copy()
+
+def _parse_city_zip_from_address(address_text: str):
+    """
+    Best-effort parse: "... Minneapolis, MN 55401"
+    Returns (city, zip)
+    """
+    t = (address_text or "").strip()
+    m = re.search(r",\s*([A-Za-z .'-]+)\s*,\s*MN\s+(\d{5})", t, re.I)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    # fallback: "... Minneapolis MN 55401"
+    m = re.search(r"\b([A-Za-z .'-]+)\s+MN\s+(\d{5})\b", t, re.I)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return "", ""
+
+
+def _make_notice_only_rows(forecl_df: pd.DataFrame, probate_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create result rows for StarTribune notices even if they don't match county parcels.
+    These rows will show in results when distress signals are selected.
+    """
+    rows = []
+
+    if forecl_df is not None and not forecl_df.empty:
+        for _, r in forecl_df.iterrows():
+            addr = str(r.get("address_text", "")).strip()
+            city, zipc = _parse_city_zip_from_address(addr)
+            rows.append(
+                {
+                    "pid_raw": "",
+                    "pid": "",
+                    "situs_address": addr,
+                    "situs_city": city,
+                    "situs_zip": zipc,
+                    "owner_name": "",
+                    "property_type": "",
+                    "market_value_total": "",
+                    "sale_date_raw": "",
+                    "sale_price": "",
+                    "score": 35,
+                    "score_notes": "Mortgage foreclosure notice",
+                    "is_notice_only": True,
+                    "has_mortgage_foreclosure_notice": True,
+                    "has_probate_notice": False,
+                    "foreclosure_sale_date": str(r.get("event_date", "") or ""),
+                    "foreclosure_notice_url": str(r.get("source_url", "") or ""),
+                    "probate_notice_url": "",
+                    "probate_mail_crosscheck_status": "No data",
+                }
+            )
+
+    if probate_df is not None and not probate_df.empty:
+        for _, r in probate_df.iterrows():
+            dec = str(r.get("decedent_name", "")).strip()
+            rep_addr = str(r.get("rep_address_text", "")).strip()
+            # Probate notices usually don't include property address; show rep address as context.
+            city, zipc = _parse_city_zip_from_address(rep_addr)
+            rows.append(
+                {
+                    "pid_raw": "",
+                    "pid": "",
+                    "situs_address": rep_addr or "(Probate notice – representative address not found)",
+                    "situs_city": city,
+                    "situs_zip": zipc,
+                    "owner_name": dec,
+                    "property_type": "Probate Notice",
+                    "market_value_total": "",
+                    "sale_date_raw": "",
+                    "sale_price": "",
+                    "score": 25,
+                    "score_notes": "Probate notice (city match)",
+                    "is_notice_only": True,
+                    "has_mortgage_foreclosure_notice": False,
+                    "has_probate_notice": True,
+                    "probate_notice_url": str(r.get("source_url", "") or ""),
+                    "foreclosure_notice_url": "",
+                    "probate_mail_crosscheck_status": "No data",
+                }
+            )
+
+    return pd.DataFrame(rows)
 
 
 def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True):
     pid_raw = digits_only(str(row.get("pid_raw", "")).strip())
-    pid_fmt = format_pid(pid_raw)
+    pid_fmt = format_pid(pid_raw) if pid_raw else "—"
 
     addr = str(row.get("situs_address", "")).strip()
     city = str(row.get("situs_city", "")).strip()
@@ -306,14 +381,16 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
     notes = str(row.get("score_notes", ""))
     ptype = str(row.get("property_type", "")).strip()
 
-    county_url = hennepin_pins_pid_url(pid_raw)
+    is_notice_only = bool(row.get("is_notice_only", False))
 
-    z_clicked = get_interaction(pid_raw, "zillow_clicked_at")
-    c_opened = get_interaction(pid_raw, "comps_opened_at")
-    saved_at = get_interaction(pid_raw, "saved_at")
-    is_saved = pid_raw in st.session_state.saved_pids
+    county_url = hennepin_pins_pid_url(pid_raw) if pid_raw else ""
 
-    z_url = zillow_search_url(addr, city, "MN", zipc)
+    z_clicked = get_interaction(pid_raw, "zillow_clicked_at") if pid_raw else ""
+    c_opened = get_interaction(pid_raw, "comps_opened_at") if pid_raw else ""
+    saved_at = get_interaction(pid_raw, "saved_at") if pid_raw else ""
+    is_saved = (pid_raw in st.session_state.saved_pids) if pid_raw else False
+
+    z_url = zillow_search_url(addr, city, "MN", zipc) if addr and city else ""
 
     sources = row.get("sources_found", [])
     if isinstance(sources, str):
@@ -322,20 +399,23 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
     fc_url = str(row.get("foreclosure_notice_url", "")).strip()
     pb_url = str(row.get("probate_notice_url", "")).strip()
 
-    pcs = str(row.get("probate_mail_crosscheck_status", "")).strip()
-
     with st.container(border=True):
         c1, c2, c3, c4, c5, c6 = st.columns([6, 2, 1, 1, 1, 1])
 
         with c1:
-            st.markdown(f"### {addr}, {city} {zipc}")
-            st.write(f"**PID:** {pid_fmt}  •  **Type:** {ptype or '—'}  •  **Owner:** {owner}")
+            st.markdown(f"### {addr or '—'}")
+            st.write(f"**City:** {city or '—'}  •  **ZIP:** {zipc or '—'}")
+            st.write(f"**PID:** {pid_fmt}  •  **Type:** {ptype or '—'}  •  **Owner/Decedent:** {owner or '—'}")
             _render_source_badges(sources)
-
-            if bool(row.get("has_probate_notice", False)):
-                st.caption(f"🔍 Probate cross-check (mailing city vs notice address): **{pcs or 'No data'}**")
-
             st.write(f"**Score:** {score}  •  {notes}")
+
+            link_row = []
+            if fc_url:
+                link_row.append(("Foreclosure source", fc_url))
+            if pb_url:
+                link_row.append(("Probate source", pb_url))
+            if link_row:
+                st.caption(" • ".join([f"[{t}]({u})" for t, u in link_row]))
 
             meta = []
             if z_clicked:
@@ -347,49 +427,57 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
             if meta:
                 st.caption(" | ".join(meta))
 
-            link_row = []
-            if fc_url:
-                link_row.append(("Foreclosure source", fc_url))
-            if pb_url:
-                link_row.append(("Probate source", pb_url))
-            if link_row:
-                st.caption(" • ".join([f"[{t}]({u})" for t, u in link_row]))
-
         with c2:
             st.write(f"**Market Value:** {row.get('market_value_total', '')}")
             st.write(f"**Last Sale:** {row.get('sale_date_raw', '')}")
             st.write(f"**Sale Price:** {row.get('sale_price', '')}")
 
         with c3:
-            st.link_button("🏛️", county_url, help="Open Hennepin County property search (PID)")
+            if county_url:
+                st.link_button("🏛️", county_url, help="Open Hennepin County property search (PID)")
+            else:
+                st.caption("—")
 
         with c4:
-            if st.button("🔎", key=f"z_{idx_key}", help="Open Zillow (new tab) and log timestamp"):
-                log_interaction(pid_raw, "zillow_clicked_at")
-                _queue_js_open(z_url)
-                st.rerun()
+            if z_url:
+                if st.button("🔎", key=f"z_{idx_key}", help="Open Zillow (new tab)"):
+                    if pid_raw:
+                        log_interaction(pid_raw, "zillow_clicked_at")
+                    _queue_js_open(z_url)
+                    st.rerun()
+            else:
+                st.caption("—")
 
         with c5:
-            if st.button("📊", key=f"c_{idx_key}", help="Open comparable analysis (tracked)"):
-                log_interaction(pid_raw, "comps_opened_at")
-                st.query_params.clear()
-                st.query_params["view"] = "comps"
-                st.query_params["pid"] = pid_raw
-                st.rerun()
+            # comps only meaningful when we have a PID
+            if not is_notice_only and pid_raw:
+                if st.button("📊", key=f"c_{idx_key}", help="Open comparable analysis (tracked)"):
+                    log_interaction(pid_raw, "comps_opened_at")
+                    st.query_params.clear()
+                    st.query_params["view"] = "comps"
+                    st.query_params["pid"] = pid_raw
+                    st.rerun()
+            else:
+                st.caption("—")
 
         with c6:
-            if allow_save:
+            if allow_save and pid_raw:
                 label = "★" if is_saved else "☆"
                 help_txt = "Unsave" if is_saved else "Save to list"
                 if st.button(label, key=f"s_{idx_key}", help=help_txt):
                     _save_toggle(pid_raw)
                     st.rerun()
+            else:
+                st.caption("—")
 
 
-def _apply_notice_sources(df: pd.DataFrame):
-    if df is None or df.empty:
-        return df
-
+def _apply_notice_sources_and_union(df: pd.DataFrame):
+    """
+    1) Fetch notices based on city match.
+    2) Enrich county leads (merge) where possible.
+    3) Create notice-only rows and UNION them into final results
+       (so distress signals appear even if they don't match county parcels).
+    """
     cfg = NoticeConfig(limit=notice_limit, max_age_days=notice_age, sleep_s=0.2)
 
     def log(msg: str):
@@ -400,33 +488,44 @@ def _apply_notice_sources(df: pd.DataFrame):
     probate_df = pd.DataFrame()
 
     if enable_mtg_notice:
-        with st.spinner("Pulling mortgage foreclosure notices (detail pages)…"):
-            # ✅ IMPORTANT: pass cities + county filter so we focus on Hennepin-relevant notices
-            forecl_df = fetch_startribune_foreclosure_notices(
-                cfg,
-                cities=cities,
-                county_filter="HENNEPIN",
-                logger=log,
-            )
+        with st.spinner("Pulling mortgage foreclosure notices (city match)…"):
+            forecl_df = fetch_startribune_foreclosure_notices(cfg, cities=cities, logger=log)
 
     if enable_probate_notice:
-        with st.spinner("Pulling probate notices (detail pages)…"):
-            probate_df = fetch_startribune_probate_notices(cfg, logger=log)
+        with st.spinner("Pulling probate notices (city match)…"):
+            probate_df = fetch_startribune_probate_notices(cfg, cities=cities, logger=log)
 
-    if (forecl_df is None or forecl_df.empty) and (probate_df is None or probate_df.empty):
-        return df
+    # Enrich county df if it exists
+    enriched = df
+    if df is not None and not df.empty and ((not forecl_df.empty) or (not probate_df.empty)):
+        enriched = merge_notices_into_leads(df, forecl_df, probate_df)
+        enriched = apply_notice_scoring(enriched)
 
-    merged = merge_notices_into_leads(df, forecl_df, probate_df)
-    merged = apply_notice_scoring(merged)
-    return merged
+    # Create notice-only rows
+    notice_only = _make_notice_only_rows(forecl_df, probate_df)
+
+    # Union
+    if enriched is None or enriched.empty:
+        combined = notice_only
+    elif notice_only is None or notice_only.empty:
+        combined = enriched
+    else:
+        combined = pd.concat([enriched, notice_only], ignore_index=True)
+
+    # Fill required columns if missing
+    for col in [
+        "has_mortgage_foreclosure_notice", "has_probate_notice", "is_notice_only",
+        "foreclosure_notice_url", "probate_notice_url"
+    ]:
+        if col not in combined.columns:
+            combined[col] = False if col.startswith("has_") or col == "is_notice_only" else ""
+
+    return combined
 
 
-# -------------------------
-# Views
-# -------------------------
 def render_results():
-    st.title("Wholesale Property Finder — Hennepin County MN")
-    st.caption("If you select any extra distress signal, results only show properties matching those signals.")
+    st.title("Wholesale Property Finder — Hennepin + Star Tribune Signals")
+    st.caption("When foreclosure/probate is selected, Star Tribune notices are included based on city match (even without county match).")
 
     _header_nav()
     _flush_js_open()
@@ -438,7 +537,8 @@ def render_results():
             if show_debug:
                 st.write(msg)
 
-        with st.spinner("Running…"):
+        # Always run county crawl (base), then union notices if selected
+        with st.spinner("Running Hennepin crawl…"):
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
             tmp.close()
             try:
@@ -446,26 +546,29 @@ def render_results():
                     cities=cities if cities else None,
                     enable_vbr=enable_vbr,
                     enable_viol=enable_viol,
-                    property_types=None,  # post-search filter handles property type
+                    property_types=None,
                     top_n=top_n,
                     out_csv=tmp.name,
                     logger=log,
                 )
-                df = pd.read_csv(tmp.name, dtype={"pid": "string", "pid_raw": "string"}, keep_default_na=False)
+                base_df = pd.read_csv(tmp.name, dtype={"pid": "string", "pid_raw": "string"}, keep_default_na=False)
             finally:
                 try:
                     os.unlink(tmp.name)
                 except Exception:
                     pass
 
-        df = _enforce_pid_columns(df)
-        df = _apply_notice_sources(df)
-        df = _compute_source_indicators(df)
+        base_df = _enforce_pid_columns(base_df)
 
-        # ✅ restrict results if extra distress signals selected
-        df = _filter_by_selected_extra_distress_signals(df)
+        # Union in notices (city match) regardless of county merge
+        combined = _apply_notice_sources_and_union(base_df)
 
-        st.session_state.results_df = df
+        combined = _compute_source_indicators(combined)
+
+        # IMPORTANT: OR restriction only applies if distress signals are selected
+        combined = _filter_by_selected_extra_distress_signals_OR(combined)
+
+        st.session_state.results_df = combined
         st.session_state.property_type_filter_results = []
         st.session_state.probate_crosscheck_filter_results = []
 
@@ -475,12 +578,9 @@ def render_results():
         return
     if df.empty:
         st.warning("No results returned with the current selections.")
-        st.caption("Tip: If foreclosure/probate signals are selected, results only include matching properties.")
         return
 
-    # -------------------------
-    # Post-search filters (static header)
-    # -------------------------
+    # Post-search filters header
     st.markdown("## Post-search Filters")
 
     pt_options = _property_type_options(df)
@@ -500,10 +600,9 @@ def render_results():
             x for x in st.session_state.probate_crosscheck_filter_results if x in pcs_options
         ]
         st.session_state.probate_crosscheck_filter_results = st.multiselect(
-            "Cross-check decedent vs owner mailing address (status from this search only)",
+            "Probate cross-check status (values from this search only)",
             options=pcs_options,
             default=st.session_state.probate_crosscheck_filter_results,
-            help="Match means owner mailing city appears in the probate notice representative address (best available cross-check).",
         )
 
     df_ui = df
@@ -511,10 +610,6 @@ def render_results():
     df_ui = _apply_probate_crosscheck_filter(df_ui, st.session_state.probate_crosscheck_filter_results)
 
     st.divider()
-
-    if df_ui.empty:
-        st.warning("No results after applying post-search filters.")
-        return
 
     st.download_button(
         "Download CSV (filtered)",
@@ -530,7 +625,6 @@ def render_results():
     page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
     start = (page - 1) * page_size
     end = min(total, start + page_size)
-
     slice_df = df_ui.iloc[start:end].copy()
 
     st.caption(f"Showing rows {start+1:,}–{end:,} of {total:,}")
@@ -551,16 +645,13 @@ def render_saved():
 
     df = st.session_state.results_df
     if df is None or df.empty:
-        st.warning("No results are loaded yet. Run the crawler first so the app can display saved details.")
+        st.warning("No results are loaded yet. Run the crawler first.")
         st.write(saved)
         return
 
-    df = _enforce_pid_columns(df)
-    df_saved = df[df["pid_raw"].isin(saved)].copy()
-
+    df_saved = df[df.get("pid_raw", "").astype(str).isin(saved)].copy()
     if df_saved.empty:
         st.warning("None of your saved PIDs are in the currently loaded results.")
-        st.write(saved)
         return
 
     st.download_button(
@@ -602,7 +693,7 @@ def render_comps(pid_any: str):
             st.rerun()
 
     if not pid_raw:
-        st.warning("No PID provided. Go back to Results and click 📊 on a property.")
+        st.warning("No PID provided. Go back to Results and click 📊 on a county property.")
         return
 
     with st.spinner("Loading county parcel…"):
@@ -620,7 +711,7 @@ def render_comps(pid_any: str):
     st.subheader(f"{addr}, {city} {zipc}")
     st.write(f"**PID:** {pid_fmt}")
 
-    if st.button("🔎 Open Zillow (tracked, new tab)"):
+    if st.button("🔎 Open Zillow (new tab)"):
         log_interaction(pid_raw, "zillow_clicked_at")
         _queue_js_open(z_url)
         st.rerun()
@@ -651,9 +742,6 @@ def render_comps(pid_any: str):
     st.dataframe(comps_df, use_container_width=True)
 
 
-# -------------------------
-# Route
-# -------------------------
 if view == "saved":
     render_saved()
 elif view == "comps":
