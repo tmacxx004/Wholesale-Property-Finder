@@ -1,6 +1,5 @@
 import re
 import time
-import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Optional
@@ -38,60 +37,64 @@ def _norm_addr(s: str) -> str:
     return s
 
 
-def _try_parse_date(text: str) -> Optional[str]:
-    """
-    Extracts 'DATE AND TIME OF SALE: February 24, 2026, 10:00 AM'
-    Returns ISO date string YYYY-MM-DD when found (time ignored).
-    """
+def _try_parse_sale_date(text: str) -> Optional[str]:
+    # "DATE AND TIME OF SALE: February 24, 2026, 10:00 AM"
     m = re.search(r"DATE\s+AND\s+TIME\s+OF\s+SALE:\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})", text, re.I)
     if not m:
         return None
     raw = m.group(1)
-    for fmt in ("%B %d, %Y",):
-        try:
-            dt = datetime.strptime(raw, fmt)
-            return dt.date().isoformat()
-        except Exception:
-            pass
-    return None
+    try:
+        dt = datetime.strptime(raw, "%B %d, %Y")
+        return dt.date().isoformat()
+    except Exception:
+        return None
 
 
 def _extract_county(text: str) -> Optional[str]:
     m = re.search(r"COUNTY\s+IN\s+WHICH\s+PROPERTY\s+IS\s+LOCATED:\s*([A-Za-z ]+)", text, re.I)
-    if not m:
-        return None
-    return _clean(m.group(1))
+    return _clean(m.group(1)) if m else None
 
 
 def _extract_address(text: str) -> Optional[str]:
-    # Many notices include: "ADDRESS OF PROPERTY: 1064 Felix Street West Saint Paul, MN 55118"
     m = re.search(r"ADDRESS\s+OF\s+PROPERTY:\s*(.+?)\s+COUNTY\s+IN\s+WHICH", text, re.I)
     if not m:
-        # fallback: "MORTGAGED PROPERTY ADDRESS: 750 Prairie Avenue Southeast, Cokato, MN 55321"
         m = re.search(r"MORTGAGED\s+PROPERTY\s+ADDRESS:\s*(.+?)\s+TAX\s+PARCEL", text, re.I)
-    if not m:
-        return None
-    return _clean(m.group(1))
+    return _clean(m.group(1)) if m else None
 
 
 def _extract_tax_parcel(text: str) -> Optional[str]:
-    # "TAX PARCEL NO.: 42-42800-01-071"
     m = re.search(r"TAX\s+PARCEL\s+(?:NO\.?|NO|I\.D\.)\s*[:#]?\s*([0-9A-Za-z\-]+)", text, re.I)
-    if not m:
-        return None
-    return _clean(m.group(1))
+    return _clean(m.group(1)) if m else None
 
 
 def _extract_probate_file(text: str) -> Optional[str]:
-    # "Court File No. 27-PA-PR-25-1831" or "Court File No.: 27-PA-PR-25-1845"
     m = re.search(r"Court\s+File\s+No\.?\s*[:#]?\s*([0-9A-Za-z\-]+)", text, re.I)
     return _clean(m.group(1)) if m else None
 
 
 def _extract_decedent(text: str) -> Optional[str]:
-    # "Estate of Danita Jean Connors-Smith, Decedent"
     m = re.search(r"Estate\s+of\s+(.+?),\s*Decedent", text, re.I)
     return _clean(m.group(1)) if m else None
+
+
+def _extract_probate_rep_address(text: str) -> str:
+    """
+    Best-effort: many probate notices include representative mailing address lines.
+    We try to capture something like:
+      "Address: 123 Main Street, Minneapolis, MN 55401"
+    If not found, returns "".
+    """
+    # Common patterns
+    patterns = [
+        r"\bAddress:\s*(.+?)(?:\bName\b|\bTelephone\b|\bAttorney\b|\bDated\b|$)",
+        r"\bMailing\s+Address:\s*(.+?)(?:\bName\b|\bTelephone\b|\bAttorney\b|\bDated\b|$)",
+        r"\bAddress\s+of\s+Personal\s+Representative:\s*(.+?)(?:\bName\b|\bTelephone\b|\bAttorney\b|\bDated\b|$)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            return _clean(m.group(1))
+    return ""
 
 
 @dataclass
@@ -106,9 +109,7 @@ def fetch_startribune_foreclosure_notices(
     logger: Optional[Callable[[str], None]] = None,
 ) -> pd.DataFrame:
     """
-    Pulls notices from Star Tribune Foreclosures category.
-    Returns columns:
-    - signal_name, source_url, event_date, county, address_text, tax_parcel_text, pid_raw_guess, norm_key
+    StarTribune Foreclosures category. Returns signals that can match by PID guess or address.
     """
     url = f"https://classifieds.startribune.com/mn/foreclosures/search?limit={cfg.limit}"
     if logger:
@@ -120,25 +121,22 @@ def fetch_startribune_foreclosure_notices(
     soup = BeautifulSoup(r.text, "lxml")
     page_text = _clean(soup.get_text(" "))
 
-    # Split into notice blocks by repeated header phrase
     blocks = re.split(r"\bNOTICE OF MORTGAGE FORECLOSURE SALE\b", page_text, flags=re.I)
+
     out = []
     cutoff = _now_utc().date() - timedelta(days=cfg.max_age_days)
 
     for b in blocks[1:]:
-        text = "NOTICE OF MORTGAGE FORECLOSURE SALE " + b
-        text = _clean(text)
+        text = _clean("NOTICE OF MORTGAGE FORECLOSURE SALE " + b)
 
         county = _extract_county(text) or ""
         addr = _extract_address(text) or ""
         tax_parcel = _extract_tax_parcel(text) or ""
-        sale_date = _try_parse_date(text)  # ISO date string or None
+        sale_date = _try_parse_sale_date(text) or ""
 
-        # If we can’t get an address, skip
         if not addr:
             continue
 
-        # Filter by max_age_days using sale date when available; else keep (some notices are postponements/etc.)
         if sale_date:
             try:
                 sd = datetime.fromisoformat(sale_date).date()
@@ -148,15 +146,13 @@ def fetch_startribune_foreclosure_notices(
                 pass
 
         pid_raw_guess = _digits_only(tax_parcel)
-
-        # A stable merge key when PID not present
         norm_key = _norm_addr(addr)
 
         out.append(
             {
                 "signal_name": "mortgage_foreclosure_notice",
                 "source_url": url,
-                "event_date": sale_date or "",
+                "event_date": sale_date,
                 "county": county,
                 "address_text": addr,
                 "tax_parcel_text": tax_parcel,
@@ -177,9 +173,7 @@ def fetch_startribune_probate_notices(
     logger: Optional[Callable[[str], None]] = None,
 ) -> pd.DataFrame:
     """
-    Pulls notices from Star Tribune Probates category.
-    Returns columns:
-    - decedent_name, court_file_no, personal_rep (best-effort), source_url, norm_decedent
+    StarTribune Probates category. Returns probate notices.
     """
     url = f"https://classifieds.startribune.com/mn/sub-probates/search?limit={cfg.limit}"
     if logger:
@@ -191,22 +185,18 @@ def fetch_startribune_probate_notices(
     soup = BeautifulSoup(r.text, "lxml")
     page_text = _clean(soup.get_text(" "))
 
-    # Probate notices vary; we split on "Estate of" which appears in many
-    # Keep it permissive.
     candidates = re.split(r"\bEstate\s+of\b", page_text, flags=re.I)
 
     out = []
     for c in candidates[1:]:
-        text = "Estate of " + c
-        text = _clean(text)
+        text = _clean("Estate of " + c)
 
         court_file = _extract_probate_file(text) or ""
         decedent = _extract_decedent(text) or ""
+        rep_addr = _extract_probate_rep_address(text) or ""
 
         if not decedent:
             continue
-
-        norm_decedent = _clean(decedent).upper()
 
         out.append(
             {
@@ -215,7 +205,8 @@ def fetch_startribune_probate_notices(
                 "event_date": "",
                 "court_file_no": court_file,
                 "decedent_name": decedent,
-                "norm_decedent": norm_decedent,
+                "rep_address_text": rep_addr,
+                "norm_decedent": _clean(decedent).upper(),
                 "signal_strength": 25,
                 "signal_details": f"Probate notice; court_file={court_file or 'unknown'}; decedent={decedent}",
             }
@@ -232,15 +223,21 @@ def merge_notices_into_leads(
     probate_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Merges notice signals into your leads table.
-    Matching strategy:
-      1) foreclosure: pid_raw match when possible else normalized address match
-      2) probate: owner_name contains decedent last name (lightweight heuristic)
+    Merges foreclosure/probate signals into leads.
+
+    Foreclosure match:
+      1) PID (if parcel number yields digits)
+      2) else normalized address match
+
+    Probate match (two-step):
+      1) owner_name contains decedent last name (heuristic)
+      2) store representative address from notice (if found)
+      3) compute cross-check status based on owner mailing city vs rep address text
     """
     df = leads_df.copy()
 
+    # Ensure pid_raw
     if "pid_raw" not in df.columns:
-        # try infer from pid column
         if "pid" in df.columns:
             df["pid_raw"] = df["pid"].astype(str).map(_digits_only)
         else:
@@ -248,13 +245,15 @@ def merge_notices_into_leads(
 
     df["pid_raw"] = df["pid_raw"].astype(str).map(_digits_only)
 
-    # Normalized address key
+    # Address key for foreclosure fallback
     if "situs_address" in df.columns:
-        df["_norm_addr_key"] = (df["situs_address"].astype(str)).map(_norm_addr)
+        df["_norm_addr_key"] = df["situs_address"].astype(str).map(_norm_addr)
     else:
         df["_norm_addr_key"] = ""
 
-    # ---- Foreclosure merge
+    # -----------------
+    # Foreclosure fields
+    # -----------------
     df["has_mortgage_foreclosure_notice"] = False
     df["foreclosure_sale_date"] = ""
     df["foreclosure_notice_url"] = ""
@@ -262,63 +261,49 @@ def merge_notices_into_leads(
 
     if forecl_df is not None and not forecl_df.empty:
         f = forecl_df.copy()
-        f["pid_raw_guess"] = f["pid_raw_guess"].astype(str).map(_digits_only)
-        f["_norm_addr_key"] = f["norm_key"].astype(str)
+        f["pid_raw_guess"] = f.get("pid_raw_guess", "").astype(str).map(_digits_only)
+        f["_norm_addr_key"] = f.get("norm_key", "").astype(str)
 
-        # First: PID guess match
+        # PID match
         pid_hits = f[f["pid_raw_guess"].astype(bool)].drop_duplicates(subset=["pid_raw_guess"])
-        if not pid_hits.empty:
-            pid_map = pid_hits.set_index("pid_raw_guess").to_dict(orient="index")
-            hit_mask = df["pid_raw"].isin(pid_map.keys())
-            df.loc[hit_mask, "has_mortgage_foreclosure_notice"] = True
-            df.loc[hit_mask, "foreclosure_sale_date"] = df.loc[hit_mask, "pid_raw"].map(
-                lambda x: pid_map.get(x, {}).get("event_date", "")
-            )
-            df.loc[hit_mask, "foreclosure_notice_url"] = df.loc[hit_mask, "pid_raw"].map(
-                lambda x: pid_map.get(x, {}).get("source_url", "")
-            )
-            df.loc[hit_mask, "foreclosure_notice_details"] = df.loc[hit_mask, "pid_raw"].map(
-                lambda x: pid_map.get(x, {}).get("signal_details", "")
-            )
+        pid_map = pid_hits.set_index("pid_raw_guess").to_dict(orient="index") if not pid_hits.empty else {}
 
-        # Second: address match for those not matched by PID
-        remaining = df[~df["has_mortgage_foreclosure_notice"]].copy()
-        if not remaining.empty:
-            addr_hits = f[f["_norm_addr_key"].astype(bool)].drop_duplicates(subset=["_norm_addr_key"])
-            if not addr_hits.empty:
-                addr_map = addr_hits.set_index("_norm_addr_key").to_dict(orient="index")
-                hit_mask2 = df["_norm_addr_key"].isin(addr_map.keys())
-                hit_mask2 = hit_mask2 & (~df["has_mortgage_foreclosure_notice"])
-                df.loc[hit_mask2, "has_mortgage_foreclosure_notice"] = True
-                df.loc[hit_mask2, "foreclosure_sale_date"] = df.loc[hit_mask2, "_norm_addr_key"].map(
-                    lambda k: addr_map.get(k, {}).get("event_date", "")
-                )
-                df.loc[hit_mask2, "foreclosure_notice_url"] = df.loc[hit_mask2, "_norm_addr_key"].map(
-                    lambda k: addr_map.get(k, {}).get("source_url", "")
-                )
-                df.loc[hit_mask2, "foreclosure_notice_details"] = df.loc[hit_mask2, "_norm_addr_key"].map(
-                    lambda k: addr_map.get(k, {}).get("signal_details", "")
-                )
+        hit_mask = df["pid_raw"].isin(pid_map.keys())
+        df.loc[hit_mask, "has_mortgage_foreclosure_notice"] = True
+        df.loc[hit_mask, "foreclosure_sale_date"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("event_date", ""))
+        df.loc[hit_mask, "foreclosure_notice_url"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("source_url", ""))
+        df.loc[hit_mask, "foreclosure_notice_details"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("signal_details", ""))
 
-    # ---- Probate merge (heuristic: last name match)
+        # Address fallback
+        addr_hits = f[f["_norm_addr_key"].astype(bool)].drop_duplicates(subset=["_norm_addr_key"])
+        addr_map = addr_hits.set_index("_norm_addr_key").to_dict(orient="index") if not addr_hits.empty else {}
+
+        hit_mask2 = df["_norm_addr_key"].isin(addr_map.keys()) & (~df["has_mortgage_foreclosure_notice"])
+        df.loc[hit_mask2, "has_mortgage_foreclosure_notice"] = True
+        df.loc[hit_mask2, "foreclosure_sale_date"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("event_date", ""))
+        df.loc[hit_mask2, "foreclosure_notice_url"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("source_url", ""))
+        df.loc[hit_mask2, "foreclosure_notice_details"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("signal_details", ""))
+
+    # -----------------
+    # Probate fields
+    # -----------------
     df["has_probate_notice"] = False
     df["probate_court_file_no"] = ""
     df["probate_decedent_name"] = ""
+    df["probate_rep_address_text"] = ""
     df["probate_notice_url"] = ""
     df["probate_notice_details"] = ""
 
+    # Cross-check status: Match / Mismatch / No data
+    df["probate_mail_crosscheck_status"] = "No data"
+
     if probate_df is not None and not probate_df.empty and "owner_name" in df.columns:
         p = probate_df.copy()
-        p["norm_decedent"] = p["norm_decedent"].astype(str)
-
-        # Build a small set of decedent last names to check quickly
+        p["norm_decedent"] = p.get("norm_decedent", "").astype(str)
         p["decedent_last"] = p["norm_decedent"].map(lambda x: x.split()[-1] if x else "")
         p = p[p["decedent_last"].astype(bool)]
 
-        # For each lead owner, check if it contains a decedent last name (cheap but useful)
-        owner_up = df["owner_name"].astype(str).str.upper()
-
-        # Create mapping last_name -> best record (first one)
+        # last_name -> best record
         last_map = p.drop_duplicates(subset=["decedent_last"]).set_index("decedent_last").to_dict(orient="index")
 
         def _find_probate(owner: str):
@@ -328,23 +313,35 @@ def merge_notices_into_leads(
                     return rec
             return None
 
+        owner_up = df["owner_name"].astype(str).str.upper()
         recs = owner_up.map(_find_probate)
 
         df["has_probate_notice"] = recs.notna()
-        df.loc[df["has_probate_notice"], "probate_court_file_no"] = recs[df["has_probate_notice"]].map(
-            lambda r: (r or {}).get("court_file_no", "")
-        )
-        df.loc[df["has_probate_notice"], "probate_decedent_name"] = recs[df["has_probate_notice"]].map(
-            lambda r: (r or {}).get("decedent_name", "")
-        )
-        df.loc[df["has_probate_notice"], "probate_notice_url"] = recs[df["has_probate_notice"]].map(
-            lambda r: (r or {}).get("source_url", "")
-        )
-        df.loc[df["has_probate_notice"], "probate_notice_details"] = recs[df["has_probate_notice"]].map(
-            lambda r: (r or {}).get("signal_details", "")
-        )
 
-    # Cleanup
+        df.loc[df["has_probate_notice"], "probate_court_file_no"] = recs[df["has_probate_notice"]].map(lambda r: (r or {}).get("court_file_no", ""))
+        df.loc[df["has_probate_notice"], "probate_decedent_name"] = recs[df["has_probate_notice"]].map(lambda r: (r or {}).get("decedent_name", ""))
+        df.loc[df["has_probate_notice"], "probate_rep_address_text"] = recs[df["has_probate_notice"]].map(lambda r: (r or {}).get("rep_address_text", ""))
+        df.loc[df["has_probate_notice"], "probate_notice_url"] = recs[df["has_probate_notice"]].map(lambda r: (r or {}).get("source_url", ""))
+        df.loc[df["has_probate_notice"], "probate_notice_details"] = recs[df["has_probate_notice"]].map(lambda r: (r or {}).get("signal_details", ""))
+
+        # Cross-check using MAILING city from county vs rep address text (best available)
+        mail_city = df.get("mailing_city", pd.Series([""] * len(df))).astype(str).str.upper()
+        rep_addr = df["probate_rep_address_text"].astype(str).str.upper()
+
+        status = []
+        for has_pb, mc, ra in zip(df["has_probate_notice"].tolist(), mail_city.tolist(), rep_addr.tolist()):
+            mc = _clean(mc).upper()
+            ra = _clean(ra).upper()
+            if not has_pb:
+                status.append("No data")
+                continue
+            if not mc or not ra:
+                status.append("No data")
+                continue
+            status.append("Match" if mc in ra else "Mismatch")
+
+        df["probate_mail_crosscheck_status"] = status
+
     df.drop(columns=["_norm_addr_key"], errors="ignore", inplace=True)
     return df
 
@@ -352,12 +349,10 @@ def merge_notices_into_leads(
 def apply_notice_scoring(df: pd.DataFrame) -> pd.DataFrame:
     """
     Adds score boosts + notes based on notices.
-    Expects df has columns created by merge_notices_into_leads.
     """
     d = df.copy()
     if "score" not in d.columns:
         d["score"] = 0
-
     if "score_notes" not in d.columns:
         d["score_notes"] = ""
 
@@ -373,16 +368,12 @@ def apply_notice_scoring(df: pd.DataFrame) -> pd.DataFrame:
     if "has_mortgage_foreclosure_notice" in d.columns:
         mask = d["has_mortgage_foreclosure_notice"].fillna(False)
         d.loc[mask, "score"] = pd.to_numeric(d.loc[mask, "score"], errors="coerce").fillna(0) + 35
-        d.loc[mask, "score_notes"] = d.loc[mask, "score_notes"].map(
-            lambda s: add_note(s, "Mortgage foreclosure notice")
-        )
+        d.loc[mask, "score_notes"] = d.loc[mask, "score_notes"].map(lambda s: add_note(s, "Mortgage foreclosure notice"))
 
     # Probate notice boost
     if "has_probate_notice" in d.columns:
         mask = d["has_probate_notice"].fillna(False)
         d.loc[mask, "score"] = pd.to_numeric(d.loc[mask, "score"], errors="coerce").fillna(0) + 25
-        d.loc[mask, "score_notes"] = d.loc[mask, "score_notes"].map(
-            lambda s: add_note(s, "Probate notice (heuristic match)")
-        )
+        d.loc[mask, "score_notes"] = d.loc[mask, "score_notes"].map(lambda s: add_note(s, "Probate notice (heuristic match)"))
 
     return d
