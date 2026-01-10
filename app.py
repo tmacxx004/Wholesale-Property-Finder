@@ -1,3 +1,6 @@
+# =========================
+# FILE: app.py
+# =========================
 import os
 import re
 import tempfile
@@ -55,6 +58,13 @@ with st.sidebar:
 
     notice_limit = st.slider("Notices per source (limit)", 24, 240, 120, 24)
     notice_age = st.slider("Max notice age (days)", 7, 365, 120, 7)
+
+    st.subheader("Fuzzy Address Match")
+    fuzzy_cutoff = st.slider(
+        "Fuzzy match threshold (0-100)",
+        70, 99, 92, 1,
+        help="Used when PID isn't available or exact address match fails. Higher = stricter.",
+    )
 
     top_n = st.slider("Top N Hennepin leads", 100, 5000, 1000, 100)
 
@@ -172,7 +182,7 @@ def _header_nav():
             st.query_params["view"] = "saved"
             st.rerun()
     with right:
-        st.caption("Distress signals are shown even if they don't match county parcels (city match).")
+        st.caption("Foreclosure merge uses PID → exact addr → fuzzy addr. Fuzzy matches show an extra icon badge.")
 
 
 def _save_toggle(pid_raw: str) -> bool:
@@ -236,6 +246,11 @@ def _compute_source_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
         if bool(r.get("has_mortgage_foreclosure_notice", False)):
             sources.append("Foreclosure Notice")
+
+        # ✅ NEW: fuzzy match indicator badge
+        if str(r.get("foreclosure_match_method", "")).strip().lower() == "fuzzy_address":
+            sources.append("Fuzzy Addr Match")
+
         if bool(r.get("has_probate_notice", False)):
             sources.append("Probate Notice")
 
@@ -255,6 +270,8 @@ def _render_source_badges(sources: list[str]):
         "MPLS Violations": "🧾 Violations",
         "Foreclosure Notice": "🚨 Foreclosure",
         "Probate Notice": "⚖️ Probate",
+        # ✅ NEW
+        "Fuzzy Addr Match": "🧩 Fuzzy",
     }
     tags = [badge_map.get(s, s) for s in sources]
     st.caption("  •  ".join(tags))
@@ -262,7 +279,7 @@ def _render_source_badges(sources: list[str]):
 
 def _filter_by_selected_extra_distress_signals_OR(df: pd.DataFrame) -> pd.DataFrame:
     """
-    OR logic:
+    OR logic (as requested):
       - if foreclosure selected -> keep foreclosure rows
       - if probate selected -> keep probate rows
       - if both selected -> keep (foreclosure OR probate)
@@ -287,15 +304,10 @@ def _filter_by_selected_extra_distress_signals_OR(df: pd.DataFrame) -> pd.DataFr
 
 
 def _parse_city_zip_from_address(address_text: str):
-    """
-    Best-effort parse: "... Minneapolis, MN 55401"
-    Returns (city, zip)
-    """
     t = (address_text or "").strip()
     m = re.search(r",\s*([A-Za-z .'-]+)\s*,\s*MN\s+(\d{5})", t, re.I)
     if m:
         return m.group(1).strip(), m.group(2).strip()
-    # fallback: "... Minneapolis MN 55401"
     m = re.search(r"\b([A-Za-z .'-]+)\s+MN\s+(\d{5})\b", t, re.I)
     if m:
         return m.group(1).strip(), m.group(2).strip()
@@ -303,10 +315,6 @@ def _parse_city_zip_from_address(address_text: str):
 
 
 def _make_notice_only_rows(forecl_df: pd.DataFrame, probate_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Create result rows for StarTribune notices even if they don't match county parcels.
-    These rows will show in results when distress signals are selected.
-    """
     rows = []
 
     if forecl_df is not None and not forecl_df.empty:
@@ -326,12 +334,16 @@ def _make_notice_only_rows(forecl_df: pd.DataFrame, probate_df: pd.DataFrame) ->
                     "sale_date_raw": "",
                     "sale_price": "",
                     "score": 35,
-                    "score_notes": "Mortgage foreclosure notice",
+                    "score_notes": "Mortgage foreclosure notice (city match)",
                     "is_notice_only": True,
                     "has_mortgage_foreclosure_notice": True,
                     "has_probate_notice": False,
                     "foreclosure_sale_date": str(r.get("event_date", "") or ""),
                     "foreclosure_notice_url": str(r.get("source_url", "") or ""),
+                    "foreclosure_notice_details": str(r.get("signal_details", "") or ""),
+                    # match method not applicable for notice-only
+                    "foreclosure_match_method": "",
+                    "foreclosure_fuzzy_score": 0,
                     "probate_notice_url": "",
                     "probate_mail_crosscheck_status": "No data",
                 }
@@ -341,7 +353,6 @@ def _make_notice_only_rows(forecl_df: pd.DataFrame, probate_df: pd.DataFrame) ->
         for _, r in probate_df.iterrows():
             dec = str(r.get("decedent_name", "")).strip()
             rep_addr = str(r.get("rep_address_text", "")).strip()
-            # Probate notices usually don't include property address; show rep address as context.
             city, zipc = _parse_city_zip_from_address(rep_addr)
             rows.append(
                 {
@@ -361,6 +372,7 @@ def _make_notice_only_rows(forecl_df: pd.DataFrame, probate_df: pd.DataFrame) ->
                     "has_mortgage_foreclosure_notice": False,
                     "has_probate_notice": True,
                     "probate_notice_url": str(r.get("source_url", "") or ""),
+                    "probate_notice_details": str(r.get("signal_details", "") or ""),
                     "foreclosure_notice_url": "",
                     "probate_mail_crosscheck_status": "No data",
                 }
@@ -382,7 +394,6 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
     ptype = str(row.get("property_type", "")).strip()
 
     is_notice_only = bool(row.get("is_notice_only", False))
-
     county_url = hennepin_pins_pid_url(pid_raw) if pid_raw else ""
 
     z_clicked = get_interaction(pid_raw, "zillow_clicked_at") if pid_raw else ""
@@ -399,6 +410,10 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
     fc_url = str(row.get("foreclosure_notice_url", "")).strip()
     pb_url = str(row.get("probate_notice_url", "")).strip()
 
+    # show fuzzy score if present
+    fmm = str(row.get("foreclosure_match_method", "")).strip()
+    fscore = row.get("foreclosure_fuzzy_score", 0)
+
     with st.container(border=True):
         c1, c2, c3, c4, c5, c6 = st.columns([6, 2, 1, 1, 1, 1])
 
@@ -407,6 +422,13 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
             st.write(f"**City:** {city or '—'}  •  **ZIP:** {zipc or '—'}")
             st.write(f"**PID:** {pid_fmt}  •  **Type:** {ptype or '—'}  •  **Owner/Decedent:** {owner or '—'}")
             _render_source_badges(sources)
+
+            if fmm.lower() == "fuzzy_address":
+                try:
+                    st.caption(f"🧩 Fuzzy address match score: **{int(fscore)}**")
+                except Exception:
+                    pass
+
             st.write(f"**Score:** {score}  •  {notes}")
 
             link_row = []
@@ -449,8 +471,7 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
                 st.caption("—")
 
         with c5:
-            # comps only meaningful when we have a PID
-            if not is_notice_only and pid_raw:
+            if (not is_notice_only) and pid_raw:
                 if st.button("📊", key=f"c_{idx_key}", help="Open comparable analysis (tracked)"):
                     log_interaction(pid_raw, "comps_opened_at")
                     st.query_params.clear()
@@ -471,13 +492,7 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
                 st.caption("—")
 
 
-def _apply_notice_sources_and_union(df: pd.DataFrame):
-    """
-    1) Fetch notices based on city match.
-    2) Enrich county leads (merge) where possible.
-    3) Create notice-only rows and UNION them into final results
-       (so distress signals appear even if they don't match county parcels).
-    """
+def _apply_notice_sources_and_union(base_df: pd.DataFrame):
     cfg = NoticeConfig(limit=notice_limit, max_age_days=notice_age, sleep_s=0.2)
 
     def log(msg: str):
@@ -495,16 +510,18 @@ def _apply_notice_sources_and_union(df: pd.DataFrame):
         with st.spinner("Pulling probate notices (city match)…"):
             probate_df = fetch_startribune_probate_notices(cfg, cities=cities, logger=log)
 
-    # Enrich county df if it exists
-    enriched = df
-    if df is not None and not df.empty and ((not forecl_df.empty) or (not probate_df.empty)):
-        enriched = merge_notices_into_leads(df, forecl_df, probate_df)
+    enriched = base_df
+    if base_df is not None and not base_df.empty and ((not forecl_df.empty) or (not probate_df.empty)):
+        enriched = merge_notices_into_leads(
+            base_df,
+            forecl_df,
+            probate_df,
+            fuzzy_score_cutoff=int(fuzzy_cutoff),
+        )
         enriched = apply_notice_scoring(enriched)
 
-    # Create notice-only rows
     notice_only = _make_notice_only_rows(forecl_df, probate_df)
 
-    # Union
     if enriched is None or enriched.empty:
         combined = notice_only
     elif notice_only is None or notice_only.empty:
@@ -512,20 +529,25 @@ def _apply_notice_sources_and_union(df: pd.DataFrame):
     else:
         combined = pd.concat([enriched, notice_only], ignore_index=True)
 
-    # Fill required columns if missing
-    for col in [
-        "has_mortgage_foreclosure_notice", "has_probate_notice", "is_notice_only",
-        "foreclosure_notice_url", "probate_notice_url"
+    # Ensure columns exist
+    for col, default in [
+        ("has_mortgage_foreclosure_notice", False),
+        ("has_probate_notice", False),
+        ("is_notice_only", False),
+        ("foreclosure_notice_url", ""),
+        ("probate_notice_url", ""),
+        ("foreclosure_match_method", ""),
+        ("foreclosure_fuzzy_score", 0),
     ]:
         if col not in combined.columns:
-            combined[col] = False if col.startswith("has_") or col == "is_notice_only" else ""
+            combined[col] = default
 
     return combined
 
 
 def render_results():
     st.title("Wholesale Property Finder — Hennepin + Star Tribune Signals")
-    st.caption("When foreclosure/probate is selected, Star Tribune notices are included based on city match (even without county match).")
+    st.caption("Foreclosure matching: PID → exact addr → fuzzy addr (when PID missing). Fuzzy matches show 🧩 badge.")
 
     _header_nav()
     _flush_js_open()
@@ -537,7 +559,6 @@ def render_results():
             if show_debug:
                 st.write(msg)
 
-        # Always run county crawl (base), then union notices if selected
         with st.spinner("Running Hennepin crawl…"):
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
             tmp.close()
@@ -560,12 +581,10 @@ def render_results():
 
         base_df = _enforce_pid_columns(base_df)
 
-        # Union in notices (city match) regardless of county merge
         combined = _apply_notice_sources_and_union(base_df)
-
         combined = _compute_source_indicators(combined)
 
-        # IMPORTANT: OR restriction only applies if distress signals are selected
+        # Distress filters are OR
         combined = _filter_by_selected_extra_distress_signals_OR(combined)
 
         st.session_state.results_df = combined
@@ -580,7 +599,6 @@ def render_results():
         st.warning("No results returned with the current selections.")
         return
 
-    # Post-search filters header
     st.markdown("## Post-search Filters")
 
     pt_options = _property_type_options(df)
