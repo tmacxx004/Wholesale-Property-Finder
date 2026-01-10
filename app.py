@@ -1,4 +1,3 @@
-# app.py
 import os
 import tempfile
 import urllib.parse
@@ -68,18 +67,23 @@ if "property_type_filter_saved" not in st.session_state:
 
 # Saved list + interaction cache
 if "saved_pids" not in st.session_state:
-    st.session_state.saved_pids = set()  # set of pid_raw strings (digits-only)
+    st.session_state.saved_pids = set()  # pid_raw digits-only
 
 if "interaction_cache" not in st.session_state:
     # pid_raw -> {"zillow_clicked_at": "...", "comps_opened_at": "...", "saved_at": "...", "unsaved_at": "..."}
     st.session_state.interaction_cache = {}
+
+# One-shot JS opener (used to open Zillow without leaving the page)
+if "js_open_url" not in st.session_state:
+    st.session_state.js_open_url = ""
+if "js_open_nonce" not in st.session_state:
+    st.session_state.js_open_nonce = 0
 
 
 # -------------------------
 # Helpers
 # -------------------------
 def now_ts() -> str:
-    # ISO timestamp (seconds) for easy sorting/display
     return datetime.now().isoformat(timespec="seconds")
 
 
@@ -99,13 +103,11 @@ def get_interaction(pid_raw: str, field: str) -> str:
 
 
 def zillow_search_url(address: str, city: str, state: str, zipc: str) -> str:
-    """Link-out only (no scraping). Opens Zillow search results for the address."""
     q = f"{address}, {city}, {state} {zipc}".strip().strip(",")
     return f"https://www.zillow.com/homes/{urllib.parse.quote_plus(q)}_rb/"
 
 
 def _enforce_pid_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Force pid_raw digits-only and pid formatted ##-###-##-###-####."""
     if df is None or df.empty:
         return df
     if "pid_raw" in df.columns:
@@ -121,7 +123,6 @@ def _property_type_options(df: pd.DataFrame) -> list[str]:
 
 
 def _apply_property_type_filter(df: pd.DataFrame, selected: list[str]) -> pd.DataFrame:
-    """Case-insensitive exact match filter on property_type."""
     if df is None or df.empty:
         return df
     if not selected or "property_type" not in df.columns:
@@ -134,7 +135,6 @@ def _apply_property_type_filter(df: pd.DataFrame, selected: list[str]) -> pd.Dat
 
 
 def _header_nav():
-    """Top navigation buttons."""
     left, mid, right = st.columns([2, 2, 6])
     with left:
         if st.button("📋 Results", use_container_width=True):
@@ -147,11 +147,10 @@ def _header_nav():
             st.query_params["view"] = "saved"
             st.rerun()
     with right:
-        st.caption("Tip: ☆/★ saves a property. Zillow + comps clicks are timestamped.")
+        st.caption("Tip: Zillow opens in a new tab without leaving the results page; clicks are timestamped.")
 
 
 def _save_toggle(pid_raw: str) -> bool:
-    """Toggle saved status. Returns new saved status."""
     pid_raw = digits_only(pid_raw)
     if not pid_raw:
         return False
@@ -165,8 +164,45 @@ def _save_toggle(pid_raw: str) -> bool:
         return True
 
 
+def _queue_js_open(url: str):
+    """
+    Queue a one-shot JS open in new tab; executed at top of Results/Saved render.
+    """
+    st.session_state.js_open_url = url
+    st.session_state.js_open_nonce += 1
+
+
+def _flush_js_open():
+    """
+    If a URL is queued, inject JS to open it in a new tab and then clear it.
+    This runs within the same page render, so user stays on Results/Saved view.
+    """
+    url = st.session_state.get("js_open_url", "")
+    nonce = st.session_state.get("js_open_nonce", 0)
+    if not url:
+        return
+
+    # Open a new tab and do not navigate the current page.
+    # Use nonce to ensure the component rerenders even for the same URL.
+    components.html(
+        f"""
+        <script>
+          (function() {{
+            const url = {url!r};
+            // Try to open a new tab. Some browsers block popups if not triggered by direct click.
+            window.open(url, "_blank", "noopener,noreferrer");
+          }})();
+        </script>
+        <div style="display:none">nonce:{nonce}</div>
+        """,
+        height=0,
+    )
+
+    # Clear after firing so it doesn't repeat on reruns
+    st.session_state.js_open_url = ""
+
+
 def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True):
-    """Reusable property card with actions + click tracking + save feature."""
     pid_raw = digits_only(str(row.get("pid_raw", "")).strip())
     pid_fmt = format_pid(pid_raw)
 
@@ -184,8 +220,10 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
     z_clicked = get_interaction(pid_raw, "zillow_clicked_at")
     c_opened = get_interaction(pid_raw, "comps_opened_at")
     saved_at = get_interaction(pid_raw, "saved_at")
-
     is_saved = pid_raw in st.session_state.saved_pids
+
+    # Build Zillow URL from row data (no extra fetch, faster & works inline)
+    z_url = zillow_search_url(addr, city, "MN", zipc)
 
     with st.container(border=True):
         c1, c2, c3, c4, c5, c6 = st.columns([6, 2, 1, 1, 1, 1])
@@ -214,12 +252,10 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
             st.link_button("🏛️", county_url, help="Open Hennepin County property search (PID)")
 
         with c4:
-            # Zillow click routes to out-view which logs and redirects immediately
-            if st.button("🔎", key=f"z_{idx_key}", help="Open Zillow immediately (tracked)"):
-                st.query_params.clear()
-                st.query_params["view"] = "out"
-                st.query_params["pid"] = pid_raw
-                st.query_params["dest"] = "zillow"
+            # ✅ One click: audit + open Zillow (new tab) without changing Streamlit page
+            if st.button("🔎", key=f"z_{idx_key}", help="Open Zillow (new tab) and log timestamp"):
+                log_interaction(pid_raw, "zillow_clicked_at")
+                _queue_js_open(z_url)
                 st.rerun()
 
         with c5:
@@ -244,9 +280,12 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
 # -------------------------
 def render_results():
     st.title("Wholesale Property Finder — Hennepin County MN")
-    st.caption("Actions: 🏛️ county • 🔎 Zillow (tracked) • 📊 comps (tracked) • ☆/★ save")
+    st.caption("Actions: 🏛️ county • 🔎 Zillow (opens new tab, tracked) • 📊 comps (tracked) • ☆/★ save")
 
     _header_nav()
+
+    # Fire any queued JS open (keeps user on this page)
+    _flush_js_open()
 
     run_btn = st.button("Run crawler", type="primary")
 
@@ -266,7 +305,7 @@ def render_results():
                     cities=cities if cities else None,
                     enable_vbr=enable_vbr,
                     enable_viol=enable_viol,
-                    property_types=None,  # filter happens after search
+                    property_types=None,  # property type filtering happens after search now
                     top_n=top_n,
                     out_csv=tmp.name,
                     logger=log,
@@ -319,7 +358,6 @@ def render_results():
         st.warning("No results after applying the property type filter.")
         return
 
-    # Download filtered view
     st.download_button(
         "Download CSV (filtered)",
         df_ui.to_csv(index=False).encode("utf-8"),
@@ -348,6 +386,9 @@ def render_saved():
 
     _header_nav()
 
+    # Fire any queued JS open here too (if user clicks Zillow from saved list)
+    _flush_js_open()
+
     saved = sorted(st.session_state.saved_pids)
     if not saved:
         st.info("Your saved list is empty. Go to Results and click ☆ to save properties.")
@@ -369,7 +410,6 @@ def render_saved():
         st.write(saved)
         return
 
-    # Property type filter above saved list (limited to values in saved results)
     st.markdown("## Property Type Filter (Saved)")
     pt_options = _property_type_options(df_saved)
 
@@ -408,70 +448,6 @@ def render_saved():
 
     for i, row in slice_df.iterrows():
         _render_property_card(row, idx_key=f"sv_{i}", allow_save=True)
-
-
-def render_out(pid_any: str):
-    """
-    Internal "click-out" view.
-    Logs audit timestamp and immediately redirects to the external destination.
-    """
-    pid_raw = digits_only(pid_any)
-    dest = (st.query_params.get("dest") or "zillow").strip().lower()
-
-    if not pid_raw:
-        st.error("Missing PID.")
-        return
-
-    # Build destination URL (needs parcel for address-based Zillow link)
-    subj = get_parcel_by_pid(pid_raw)
-    if subj is None:
-        st.error("Could not load parcel details to build the external link.")
-        return
-
-    addr = subj.get("situs_address", "")
-    city = subj.get("situs_city", "")
-    zipc = subj.get("situs_zip", "")
-
-    if dest == "zillow":
-        # 1) Log audit
-        log_interaction(pid_raw, "zillow_clicked_at")
-
-        # 2) Build URL
-        url = zillow_search_url(addr, city, "MN", zipc)
-
-        # 3) Immediate redirect (no second click)
-        components.html(
-            f"""
-            <html>
-              <head>
-                <meta charset="utf-8" />
-                <title>Redirecting…</title>
-                <script>
-                  setTimeout(function() {{
-                    window.location.href = {url!r};
-                  }}, 25);
-                </script>
-              </head>
-              <body></body>
-            </html>
-            """,
-            height=0,
-        )
-
-        # Fallback UI (if redirects blocked)
-        st.success(f"Audit saved: Zillow clicked at {get_interaction(pid_raw, 'zillow_clicked_at')}")
-        st.link_button("If you are not redirected, click here to open Zillow", url)
-
-        if st.button("⬅️ Back to Results", type="primary"):
-            st.query_params.clear()
-            st.query_params["view"] = "results"
-            st.rerun()
-    else:
-        st.warning(f"Unknown destination: {dest}")
-        if st.button("⬅️ Back to Results", type="primary"):
-            st.query_params.clear()
-            st.query_params["view"] = "results"
-            st.rerun()
 
 
 def render_comps(pid_any: str):
@@ -533,12 +509,10 @@ def render_comps(pid_any: str):
     k3.metric("Last Sale Date", sale_date or "—")
     k4.metric("Property Type", ptype or "—")
 
-    # Tracked Zillow click (redirects immediately)
-    if st.button("🔎 Track + Open Zillow"):
-        st.query_params.clear()
-        st.query_params["view"] = "out"
-        st.query_params["pid"] = pid_raw
-        st.query_params["dest"] = "zillow"
+    # On comps page, we still can open Zillow in new tab without leaving the page
+    if st.button("🔎 Open Zillow (tracked, new tab)"):
+        log_interaction(pid_raw, "zillow_clicked_at")
+        _queue_js_open(z_url)
         st.rerun()
 
     st.divider()
@@ -588,7 +562,5 @@ if view == "saved":
     render_saved()
 elif view == "comps":
     render_comps(pid_qp)
-elif view == "out":
-    render_out(pid_qp)
 else:
     render_results()
