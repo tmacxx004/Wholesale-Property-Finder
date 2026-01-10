@@ -22,7 +22,7 @@ view = (st.query_params.get("view") or "results").strip().lower()
 pid_qp = (st.query_params.get("pid") or "").strip()
 
 # -------------------------
-# Sidebar
+# Sidebar (search inputs only)
 # -------------------------
 default_city_list = [
     "Minneapolis", "Bloomington", "Brooklyn Park", "Brooklyn Center", "Richfield",
@@ -30,23 +30,8 @@ default_city_list = [
     "Minnetonka", "Hopkins", "Crystal", "New Hope", "Robbinsdale", "Maple Grove",
 ]
 
-# Some common-ish property type labels. Your dataset may have more/different values.
-default_property_types = [
-    "SINGLE FAMILY",
-    "TOWNHOUSE",
-    "CONDO",
-    "DUPLEX",
-    "TRIPLEX",
-    "FOURPLEX",
-    "MULTI FAMILY",
-    "APARTMENT",
-    "COMMERCIAL",
-    "INDUSTRIAL",
-    "VACANT LAND",
-]
-
 with st.sidebar:
-    st.header("Filters")
+    st.header("Search Filters")
 
     cities = st.multiselect(
         "Cities/Suburbs (Hennepin MUNIC_NM)",
@@ -61,52 +46,54 @@ with st.sidebar:
     top_n = st.slider("Top N leads", 100, 5000, 1000, 100)
 
     st.divider()
-    st.subheader("Property type filter")
-
-    # Use seen property types from prior runs if available
-    if "property_type_options" not in st.session_state:
-        st.session_state.property_type_options = default_property_types
-
-    property_types_selected = st.multiselect(
-        "Select property types (exact match; case-insensitive)",
-        options=st.session_state.property_type_options,
-        default=[],
-        help="If empty, no property-type filtering is applied.",
-    )
-
-    # Optional manual entry (comma-separated)
-    property_types_manual = st.text_input(
-        "Add property types (comma-separated, optional)",
-        value="",
-        help="Use this if your desired type isn't listed above. Example: 'Residential, Duplex'",
-    )
-
-    st.divider()
     st.header("Display")
     page_size = st.slider("Rows per page", 10, 200, 50, 10)
     show_debug = st.checkbox("Show debug logs", value=False)
 
+# Persist results + UI filters across reruns
 if "results_df" not in st.session_state:
     st.session_state.results_df = None
+if "property_type_filter" not in st.session_state:
+    st.session_state.property_type_filter = []
 
 
 def zillow_search_url(address: str, city: str, state: str, zipc: str) -> str:
-    """
-    Link-out only (no scraping). Opens Zillow search results for the address.
-    """
+    """Link-out only (no scraping). Opens Zillow search results for the address."""
     q = f"{address}, {city}, {state} {zipc}".strip().strip(",")
     return f"https://www.zillow.com/homes/{urllib.parse.quote_plus(q)}_rb/"
 
 
-def _merge_property_type_filters(selected: list[str], manual_csv: str) -> list[str]:
-    manual = []
-    if manual_csv.strip():
-        manual = [x.strip() for x in manual_csv.split(",") if x.strip()]
-    merged = []
-    for x in (selected or []) + manual:
-        if x and x not in merged:
-            merged.append(x)
-    return merged
+def _enforce_pid_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Force pid_raw digits-only and pid formatted ##-###-##-###-####."""
+    if df is None or df.empty:
+        return df
+    if "pid_raw" in df.columns:
+        df["pid_raw"] = df["pid_raw"].astype(str).map(digits_only)
+        df["pid"] = df["pid_raw"].map(format_pid)
+    return df
+
+
+def _property_type_options_from_results(df: pd.DataFrame) -> list[str]:
+    if df is None or df.empty or "property_type" not in df.columns:
+        return []
+    opts = sorted({str(x).strip() for x in df["property_type"].tolist() if str(x).strip()})
+    return opts
+
+
+def _apply_property_type_filter(df: pd.DataFrame, selected: list[str]) -> pd.DataFrame:
+    """Apply property type filter (case-insensitive exact match)."""
+    if df is None or df.empty:
+        return df
+    if not selected:
+        return df
+    if "property_type" not in df.columns:
+        return df
+
+    allowed = {x.strip().upper() for x in selected if x.strip()}
+    d2 = df.copy()
+    d2["_pt"] = d2["property_type"].astype(str).str.strip().str.upper()
+    d2 = d2[d2["_pt"].isin(allowed)].drop(columns=["_pt"])
+    return d2
 
 
 # -------------------------
@@ -118,9 +105,6 @@ def render_results():
         "Generate a prioritized lead list from Hennepin distress signals and optionally stack Minneapolis datasets. "
         "Actions: 🏛️ county page • 🔎 Zillow link • 📊 comps"
     )
-
-    # Build final property type filter list
-    property_types_filter = _merge_property_type_filters(property_types_selected, property_types_manual)
 
     run_btn = st.button("Run crawler", type="primary")
 
@@ -136,11 +120,12 @@ def render_results():
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
             tmp.close()
             try:
+                # NOTE: property_types filter is intentionally post-search now
                 run(
                     cities=cities if cities else None,
                     enable_vbr=enable_vbr,
                     enable_viol=enable_viol,
-                    property_types=property_types_filter if property_types_filter else None,
+                    property_types=None,   # <-- IMPORTANT: do not filter in crawler
                     top_n=top_n,
                     out_csv=tmp.name,
                     logger=log,
@@ -156,18 +141,11 @@ def render_results():
                 except Exception:
                     pass
 
-        # Enforce PID formatting (belt + suspenders)
-        if "pid_raw" in df.columns:
-            df["pid_raw"] = df["pid_raw"].astype(str).map(digits_only)
-            df["pid"] = df["pid_raw"].map(format_pid)
-
-        # Update property type options from returned data (for next runs)
-        if "property_type" in df.columns:
-            found = sorted({str(x).strip() for x in df["property_type"].tolist() if str(x).strip()})
-            if found:
-                st.session_state.property_type_options = found
-
+        df = _enforce_pid_columns(df)
         st.session_state.results_df = df
+
+        # Reset property type filter when you re-run a new search
+        st.session_state.property_type_filter = []
 
     df = st.session_state.results_df
     if df is None:
@@ -175,21 +153,37 @@ def render_results():
         return
 
     if df.empty:
-        st.warning("No results returned. Try removing filters or changing Minneapolis stacking options.")
+        st.warning("No results returned. Try changing city or Minneapolis stacking options.")
         return
 
-    # Apply property type filter in UI as well (extra safety)
-    property_types_filter = _merge_property_type_filters(property_types_selected, property_types_manual)
-    if property_types_filter:
-        df_ui = df.copy()
-        df_ui["_pt_upper"] = df_ui.get("property_type", "").astype(str).str.strip().str.upper()
-        allowed = {x.strip().upper() for x in property_types_filter if x.strip()}
-        df_ui = df_ui[df_ui["_pt_upper"].isin(allowed)].drop(columns=["_pt_upper"])
-    else:
+    # -------------------------
+    # Static Property Type filter ABOVE results (post-search only)
+    # -------------------------
+    st.markdown("## Property Type Filter")
+
+    pt_options = _property_type_options_from_results(df)
+    if not pt_options:
+        st.caption("No property type field available in results.")
         df_ui = df
+    else:
+        # Keep any existing selection that still exists in options
+        st.session_state.property_type_filter = [
+            x for x in st.session_state.property_type_filter if x in pt_options
+        ]
+
+        st.session_state.property_type_filter = st.multiselect(
+            "Select property types (only values returned in this search)",
+            options=pt_options,
+            default=st.session_state.property_type_filter,
+            help="This filter is applied AFTER the crawler runs. Clear selection to show all types.",
+        )
+
+        df_ui = _apply_property_type_filter(df, st.session_state.property_type_filter)
+
+    st.divider()
 
     if df_ui.empty:
-        st.warning("No results after applying the property type filter in the UI.")
+        st.warning("No results after applying the property type filter.")
         return
 
     # Download filtered view
@@ -198,6 +192,7 @@ def render_results():
 
     st.subheader("Results")
 
+    # Pagination
     total = len(df_ui)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
@@ -333,7 +328,7 @@ def render_comps(pid_any: str):
     st.markdown(
         """
 - Verify motivation stack: delinquency years, absentee, forfeiture indicators, and (optional) city signals.
-- Confirm condition: drive-by + photos/notes from your buyer pool (Zillow link is for viewing only).
+- Confirm condition: drive-by + your buyer pool notes (Zillow link is for viewing only).
 - Offer math: **ARV × (0.70–0.80) − Repairs − Assignment fee** (tune to your buyer pool).
 """
     )
