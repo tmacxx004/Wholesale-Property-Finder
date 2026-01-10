@@ -3,3 +3,5 @@ requests
 pandas
 python-dateutil
 rapidfuzz
+beautifulsoup4
+lxml
