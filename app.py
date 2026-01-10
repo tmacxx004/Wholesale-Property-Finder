@@ -62,11 +62,18 @@ with st.sidebar:
     page_size = st.slider("Rows per page", 10, 200, 50, 10)
     show_debug = st.checkbox("Show debug logs", value=False)
 
+# -------------------------
+# Session State
+# -------------------------
 if "results_df" not in st.session_state:
     st.session_state.results_df = None
 
 if "property_type_filter_results" not in st.session_state:
     st.session_state.property_type_filter_results = []
+
+if "probate_crosscheck_filter_results" not in st.session_state:
+    st.session_state.probate_crosscheck_filter_results = []
+
 if "property_type_filter_saved" not in st.session_state:
     st.session_state.property_type_filter_saved = []
 
@@ -82,6 +89,9 @@ if "js_open_nonce" not in st.session_state:
     st.session_state.js_open_nonce = 0
 
 
+# -------------------------
+# Helpers
+# -------------------------
 def now_ts() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -133,6 +143,24 @@ def _apply_property_type_filter(df: pd.DataFrame, selected: list[str]) -> pd.Dat
     return d2
 
 
+def _probate_crosscheck_options(df: pd.DataFrame) -> list[str]:
+    if df is None or df.empty or "probate_mail_crosscheck_status" not in df.columns:
+        return []
+    return sorted({str(x).strip() for x in df["probate_mail_crosscheck_status"].tolist() if str(x).strip()})
+
+
+def _apply_probate_crosscheck_filter(df: pd.DataFrame, selected: list[str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    if not selected or "probate_mail_crosscheck_status" not in df.columns:
+        return df
+    allowed = {x.strip().upper() for x in selected if x.strip()}
+    d2 = df.copy()
+    d2["_pcs"] = d2["probate_mail_crosscheck_status"].astype(str).str.strip().str.upper()
+    d2 = d2[d2["_pcs"].isin(allowed)].drop(columns=["_pcs"])
+    return d2
+
+
 def _header_nav():
     left, mid, right = st.columns([2, 2, 6])
     with left:
@@ -146,7 +174,7 @@ def _header_nav():
             st.query_params["view"] = "saved"
             st.rerun()
     with right:
-        st.caption("Tip: Zillow opens in a new tab without leaving the page; clicks are timestamped.")
+        st.caption("Sources show as badges. Zillow opens new tab without leaving Results; clicks are timestamped.")
 
 
 def _save_toggle(pid_raw: str) -> bool:
@@ -173,7 +201,6 @@ def _flush_js_open():
     nonce = st.session_state.get("js_open_nonce", 0)
     if not url:
         return
-
     components.html(
         f"""
         <script>
@@ -187,6 +214,55 @@ def _flush_js_open():
         height=0,
     )
     st.session_state.js_open_url = ""
+
+
+def _compute_source_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add a column with multiple indicators showing where each lead is found.
+    """
+    if df is None or df.empty:
+        return df
+
+    d = df.copy()
+
+    def sources_for_row(r) -> list[str]:
+        sources = ["Hennepin County"]  # base source always present
+
+        # Minneapolis sources
+        if bool(r.get("mpls_vacant_condemned", False)):
+            sources.append("MPLS VBR")
+        try:
+            if int(r.get("mpls_open_violation_count", 0) or 0) > 0:
+                sources.append("MPLS Violations")
+        except Exception:
+            pass
+
+        # Notice sources
+        if bool(r.get("has_mortgage_foreclosure_notice", False)):
+            sources.append("Foreclosure Notice")
+        if bool(r.get("has_probate_notice", False)):
+            sources.append("Probate Notice")
+
+        return sources
+
+    d["sources_found"] = d.apply(sources_for_row, axis=1)
+    d["sources_found_text"] = d["sources_found"].map(lambda xs: " | ".join(xs) if isinstance(xs, list) else str(xs))
+    return d
+
+
+def _render_source_badges(sources: list[str]):
+    if not sources:
+        return
+    # Simple “badge” feel using emojis
+    badge_map = {
+        "Hennepin County": "🏛️ Hennepin",
+        "MPLS VBR": "🏚️ VBR",
+        "MPLS Violations": "🧾 Violations",
+        "Foreclosure Notice": "🚨 Foreclosure",
+        "Probate Notice": "⚖️ Probate",
+    }
+    tags = [badge_map.get(s, s) for s in sources]
+    st.caption("  •  ".join(tags))
 
 
 def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True):
@@ -210,15 +286,16 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
 
     z_url = zillow_search_url(addr, city, "MN", zipc)
 
-    # Notice signals
-    has_fc = bool(row.get("has_mortgage_foreclosure_notice", False))
-    fc_date = str(row.get("foreclosure_sale_date", "")).strip()
-    fc_url = str(row.get("foreclosure_notice_url", "")).strip()
+    sources = row.get("sources_found", [])
+    if isinstance(sources, str):
+        sources = [s.strip() for s in sources.split("|") if s.strip()]
 
-    has_pb = bool(row.get("has_probate_notice", False))
-    pb_file = str(row.get("probate_court_file_no", "")).strip()
-    pb_dec = str(row.get("probate_decedent_name", "")).strip()
+    # Foreclosure + probate detail links
+    fc_url = str(row.get("foreclosure_notice_url", "")).strip()
     pb_url = str(row.get("probate_notice_url", "")).strip()
+
+    # Probate crosscheck status
+    pcs = str(row.get("probate_mail_crosscheck_status", "")).strip()
 
     with st.container(border=True):
         c1, c2, c3, c4, c5, c6 = st.columns([6, 2, 1, 1, 1, 1])
@@ -226,15 +303,13 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
         with c1:
             st.markdown(f"### {addr}, {city} {zipc}")
             st.write(f"**PID:** {pid_fmt}  •  **Type:** {ptype or '—'}  •  **Owner:** {owner}")
-            st.write(f"**Score:** {score}  •  {notes}")
+            _render_source_badges(sources)
 
-            badges = []
-            if has_fc:
-                badges.append(f"🚨 Foreclosure Notice{' (Sale: ' + fc_date + ')' if fc_date else ''}")
-            if has_pb:
-                badges.append(f"⚖️ Probate Notice{(' ('+pb_file+')') if pb_file else ''}")
-            if badges:
-                st.info(" | ".join(badges))
+            # Show probate cross-check status if probate exists
+            if bool(row.get("has_probate_notice", False)):
+                st.caption(f"🔍 Probate cross-check (mailing city vs notice address): **{pcs or 'No data'}**")
+
+            st.write(f"**Score:** {score}  •  {notes}")
 
             meta = []
             if z_clicked:
@@ -248,9 +323,9 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
 
             # Audit links
             link_row = []
-            if has_fc and fc_url:
+            if fc_url:
                 link_row.append(("Foreclosure source", fc_url))
-            if has_pb and pb_url:
+            if pb_url:
                 link_row.append(("Probate source", pb_url))
             if link_row:
                 st.caption(" • ".join([f"[{t}]({u})" for t, u in link_row]))
@@ -287,17 +362,12 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
 
 
 def _apply_notice_sources(df: pd.DataFrame):
-    """
-    Fetch and merge foreclosure/probate notices into df if enabled.
-    """
     if df is None or df.empty:
         return df
 
     cfg = NoticeConfig(limit=notice_limit, max_age_days=notice_age, sleep_s=0.25)
 
-    logs = []
     def log(msg: str):
-        logs.append(msg)
         if show_debug:
             st.write(msg)
 
@@ -322,7 +392,7 @@ def _apply_notice_sources(df: pd.DataFrame):
 
 def render_results():
     st.title("Wholesale Property Finder — Hennepin County MN")
-    st.caption("Actions: 🏛️ county • 🔎 Zillow (new tab, tracked) • 📊 comps (tracked) • ☆/★ save")
+    st.caption("Sources show as badges. Multiple badges appear when merged signals match the same property.")
 
     _header_nav()
     _flush_js_open()
@@ -330,9 +400,7 @@ def render_results():
     run_btn = st.button("Run crawler", type="primary")
 
     if run_btn:
-        logs = []
         def log(msg: str):
-            logs.append(msg)
             if show_debug:
                 st.write(msg)
 
@@ -357,40 +425,64 @@ def render_results():
                     pass
 
         df = _enforce_pid_columns(df)
-
-        # 🔥 NEW: apply foreclosure + probate sources (optional)
         df = _apply_notice_sources(df)
+        df = _compute_source_indicators(df)
 
         st.session_state.results_df = df
         st.session_state.property_type_filter_results = []
+        st.session_state.probate_crosscheck_filter_results = []
 
     df = st.session_state.results_df
     if df is None:
         st.info("Click **Run crawler** to generate results.")
         return
     if df.empty:
-        st.warning("No results returned. Try changing city or Minneapolis stacking options.")
+        st.warning("No results returned. Try changing city or options.")
         return
 
-    st.markdown("## Property Type Filter")
+    # -------------------------
+    # Post-search filters (STATIC HEADER ABOVE RESULTS)
+    # -------------------------
+    st.markdown("## Post-search Filters")
+
+    # 1) Property Type Filter (existing)
     pt_options = _property_type_options(df)
     if pt_options:
         st.session_state.property_type_filter_results = [
             x for x in st.session_state.property_type_filter_results if x in pt_options
         ]
         st.session_state.property_type_filter_results = st.multiselect(
-            "Filter results by property type (values from this search only)",
+            "Property type (values from this search only)",
             options=pt_options,
             default=st.session_state.property_type_filter_results,
         )
-        df_ui = _apply_property_type_filter(df, st.session_state.property_type_filter_results)
     else:
-        df_ui = df
+        st.caption("No property_type values available for filtering.")
+
+    # 2) NEW: Probate cross-check filter
+    pcs_options = _probate_crosscheck_options(df)
+    if pcs_options:
+        st.session_state.probate_crosscheck_filter_results = [
+            x for x in st.session_state.probate_crosscheck_filter_results if x in pcs_options
+        ]
+        st.session_state.probate_crosscheck_filter_results = st.multiselect(
+            "Cross-check decedent vs owner mailing address (status from this search only)",
+            options=pcs_options,
+            default=st.session_state.probate_crosscheck_filter_results,
+            help="Match means owner mailing city appears in the probate notice representative address (best available cross-check).",
+        )
+    else:
+        st.caption("No probate cross-check statuses available (enable Probate notices to populate).")
+
+    # Apply filters
+    df_ui = df
+    df_ui = _apply_property_type_filter(df_ui, st.session_state.property_type_filter_results)
+    df_ui = _apply_probate_crosscheck_filter(df_ui, st.session_state.probate_crosscheck_filter_results)
 
     st.divider()
 
     if df_ui.empty:
-        st.warning("No results after applying the property type filter.")
+        st.warning("No results after applying post-search filters.")
         return
 
     st.download_button(
@@ -439,38 +531,21 @@ def render_saved():
         st.write(saved)
         return
 
-    st.markdown("## Property Type Filter (Saved)")
-    pt_options = _property_type_options(df_saved)
-    if pt_options:
-        st.session_state.property_type_filter_saved = [
-            x for x in st.session_state.property_type_filter_saved if x in pt_options
-        ]
-        st.session_state.property_type_filter_saved = st.multiselect(
-            "Filter saved by property type (values from saved list only)",
-            options=pt_options,
-            default=st.session_state.property_type_filter_saved,
-        )
-        df_ui = _apply_property_type_filter(df_saved, st.session_state.property_type_filter_saved)
-    else:
-        df_ui = df_saved
-
-    st.divider()
-
     st.download_button(
-        "Download CSV (saved, filtered)",
-        df_ui.to_csv(index=False).encode("utf-8"),
-        "saved_properties_filtered.csv",
+        "Download CSV (saved)",
+        df_saved.to_csv(index=False).encode("utf-8"),
+        "saved_properties.csv",
         "text/csv",
     )
 
-    st.subheader(f"Saved ({len(df_ui):,})")
+    st.subheader(f"Saved ({len(df_saved):,})")
 
-    total = len(df_ui)
+    total = len(df_saved)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = st.number_input("Page (Saved)", min_value=1, max_value=total_pages, value=1, step=1)
     start = (page - 1) * page_size
     end = min(total, start + page_size)
-    slice_df = df_ui.iloc[start:end].copy()
+    slice_df = df_saved.iloc[start:end].copy()
 
     st.caption(f"Showing rows {start+1:,}–{end:,} of {total:,}")
 
@@ -508,27 +583,15 @@ def render_comps(pid_any: str):
     addr = subj.get("situs_address", "")
     city = subj.get("situs_city", "")
     zipc = subj.get("situs_zip", "")
-    owner = subj.get("owner_name", "")
-    ptype = subj.get("property_type", "")
-    mv = subj.get("market_value_total", None)
-    sale_date = subj.get("sale_date", "")
-    sale_price = subj.get("sale_price", None)
-
     z_url = zillow_search_url(addr, city, "MN", zipc)
 
     st.subheader(f"{addr}, {city} {zipc}")
-    st.write(f"**PID:** {pid_fmt}  •  **Type:** {ptype or '—'}  •  **Owner:** {owner or '—'}")
+    st.write(f"**PID:** {pid_fmt}")
 
     if st.button("🔎 Open Zillow (tracked, new tab)"):
         log_interaction(pid_raw, "zillow_clicked_at")
         _queue_js_open(z_url)
         st.rerun()
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("County Market Value", f"${mv:,.0f}" if isinstance(mv, (int, float)) else str(mv))
-    k2.metric("Last Sale Price", f"${sale_price:,.0f}" if isinstance(sale_price, (int, float)) else str(sale_price))
-    k3.metric("Last Sale Date", sale_date or "—")
-    k4.metric("Property Type", ptype or "—")
 
     st.divider()
     st.subheader("Nearby County Comps")
@@ -552,10 +615,6 @@ def render_comps(pid_any: str):
     if comps_df is None or comps_df.empty:
         st.warning("No county comps found with current filters.")
         return
-
-    vals = pd.to_numeric(comps_df.get("market_value_total"), errors="coerce").dropna()
-    if len(vals) >= 3:
-        st.success(f"Directional ARV hint (median county market value of comps): **${vals.median():,.0f}**")
 
     st.dataframe(comps_df, use_container_width=True)
 
