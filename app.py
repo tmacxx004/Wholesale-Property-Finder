@@ -217,18 +217,12 @@ def _flush_js_open():
 
 
 def _compute_source_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add a column with multiple indicators showing where each lead is found.
-    """
     if df is None or df.empty:
         return df
-
     d = df.copy()
 
     def sources_for_row(r) -> list[str]:
-        sources = ["Hennepin County"]  # base source always present
-
-        # Minneapolis sources
+        sources = ["Hennepin County"]
         if bool(r.get("mpls_vacant_condemned", False)):
             sources.append("MPLS VBR")
         try:
@@ -236,13 +230,10 @@ def _compute_source_indicators(df: pd.DataFrame) -> pd.DataFrame:
                 sources.append("MPLS Violations")
         except Exception:
             pass
-
-        # Notice sources
         if bool(r.get("has_mortgage_foreclosure_notice", False)):
             sources.append("Foreclosure Notice")
         if bool(r.get("has_probate_notice", False)):
             sources.append("Probate Notice")
-
         return sources
 
     d["sources_found"] = d.apply(sources_for_row, axis=1)
@@ -253,7 +244,6 @@ def _compute_source_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def _render_source_badges(sources: list[str]):
     if not sources:
         return
-    # Simple “badge” feel using emojis
     badge_map = {
         "Hennepin County": "🏛️ Hennepin",
         "MPLS VBR": "🏚️ VBR",
@@ -263,6 +253,39 @@ def _render_source_badges(sources: list[str]):
     }
     tags = [badge_map.get(s, s) for s in sources]
     st.caption("  •  ".join(tags))
+
+
+def _filter_by_selected_extra_distress_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    NEW behavior:
+    If the user selects ANY 'Extra distress signals' option(s),
+    then only keep properties that match at least one selected signal.
+      - Mortgage foreclosure notices -> has_mortgage_foreclosure_notice
+      - Probate notices -> has_probate_notice
+    """
+    if df is None or df.empty:
+        return df
+
+    selected_masks = []
+
+    if enable_mtg_notice:
+        m = df.get("has_mortgage_foreclosure_notice", pd.Series([False] * len(df)))
+        selected_masks.append(m.fillna(False).astype(bool))
+
+    if enable_probate_notice:
+        m = df.get("has_probate_notice", pd.Series([False] * len(df)))
+        selected_masks.append(m.fillna(False).astype(bool))
+
+    # If none selected, do not restrict results
+    if not selected_masks:
+        return df
+
+    # OR logic across selected signals: keep rows that match ANY selected signal
+    mask = selected_masks[0]
+    for m in selected_masks[1:]:
+        mask = mask | m
+
+    return df.loc[mask].copy()
 
 
 def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True):
@@ -290,11 +313,9 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
     if isinstance(sources, str):
         sources = [s.strip() for s in sources.split("|") if s.strip()]
 
-    # Foreclosure + probate detail links
     fc_url = str(row.get("foreclosure_notice_url", "")).strip()
     pb_url = str(row.get("probate_notice_url", "")).strip()
 
-    # Probate crosscheck status
     pcs = str(row.get("probate_mail_crosscheck_status", "")).strip()
 
     with st.container(border=True):
@@ -305,7 +326,6 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
             st.write(f"**PID:** {pid_fmt}  •  **Type:** {ptype or '—'}  •  **Owner:** {owner}")
             _render_source_badges(sources)
 
-            # Show probate cross-check status if probate exists
             if bool(row.get("has_probate_notice", False)):
                 st.caption(f"🔍 Probate cross-check (mailing city vs notice address): **{pcs or 'No data'}**")
 
@@ -321,7 +341,6 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
             if meta:
                 st.caption(" | ".join(meta))
 
-            # Audit links
             link_row = []
             if fc_url:
                 link_row.append(("Foreclosure source", fc_url))
@@ -392,7 +411,7 @@ def _apply_notice_sources(df: pd.DataFrame):
 
 def render_results():
     st.title("Wholesale Property Finder — Hennepin County MN")
-    st.caption("Sources show as badges. Multiple badges appear when merged signals match the same property.")
+    st.caption("If you select any extra distress signal, results will only show properties that match those signals.")
 
     _header_nav()
     _flush_js_open()
@@ -428,6 +447,9 @@ def render_results():
         df = _apply_notice_sources(df)
         df = _compute_source_indicators(df)
 
+        # ✅ NEW: if any extra distress signal is selected, restrict results to matching properties
+        df = _filter_by_selected_extra_distress_signals(df)
+
         st.session_state.results_df = df
         st.session_state.property_type_filter_results = []
         st.session_state.probate_crosscheck_filter_results = []
@@ -437,7 +459,8 @@ def render_results():
         st.info("Click **Run crawler** to generate results.")
         return
     if df.empty:
-        st.warning("No results returned. Try changing city or options.")
+        st.warning("No results returned with the current selections.")
+        st.caption("Tip: If you selected foreclosure/probate signals, results only include matching properties.")
         return
 
     # -------------------------
@@ -445,7 +468,6 @@ def render_results():
     # -------------------------
     st.markdown("## Post-search Filters")
 
-    # 1) Property Type Filter (existing)
     pt_options = _property_type_options(df)
     if pt_options:
         st.session_state.property_type_filter_results = [
@@ -459,7 +481,6 @@ def render_results():
     else:
         st.caption("No property_type values available for filtering.")
 
-    # 2) NEW: Probate cross-check filter
     pcs_options = _probate_crosscheck_options(df)
     if pcs_options:
         st.session_state.probate_crosscheck_filter_results = [
@@ -474,7 +495,6 @@ def render_results():
     else:
         st.caption("No probate cross-check statuses available (enable Probate notices to populate).")
 
-    # Apply filters
     df_ui = df
     df_ui = _apply_property_type_filter(df_ui, st.session_state.property_type_filter_results)
     df_ui = _apply_probate_crosscheck_filter(df_ui, st.session_state.probate_crosscheck_filter_results)
