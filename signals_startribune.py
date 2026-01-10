@@ -1,6 +1,3 @@
-# =========================
-# FILE: signals_startribune.py
-# =========================
 import re
 import time
 from dataclasses import dataclass
@@ -10,7 +7,15 @@ from typing import Callable, Optional, Iterable, Dict, Any, Tuple
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from rapidfuzz import fuzz, process
+
+# Optional dependency: rapidfuzz (fast)
+# If missing on Streamlit Cloud, we fall back to difflib.
+try:
+    from rapidfuzz import fuzz, process  # type: ignore
+    _HAS_RAPIDFUZZ = True
+except Exception:
+    _HAS_RAPIDFUZZ = False
+    import difflib
 
 
 DEFAULT_HEADERS = {
@@ -284,11 +289,6 @@ def fetch_startribune_probate_notices(
 
 
 def _build_fuzzy_index(df: pd.DataFrame) -> Tuple[list[str], Dict[str, int]]:
-    """
-    Returns:
-      - choices: list of normalized addresses
-      - norm_to_index: mapping from norm address -> row index in df (first occurrence)
-    """
     norms = df.get("situs_address", pd.Series([""] * len(df))).astype(str).map(_norm_addr).tolist()
     norm_to_index: Dict[str, int] = {}
     for i, n in enumerate(norms):
@@ -298,20 +298,27 @@ def _build_fuzzy_index(df: pd.DataFrame) -> Tuple[list[str], Dict[str, int]]:
     return choices, norm_to_index
 
 
-def _fuzzy_best_match(
-    query_norm: str,
-    choices: list[str],
-    *,
-    score_cutoff: int = 92,
-) -> Tuple[str, int]:
+def _fuzzy_best_match(query_norm: str, choices: list[str], *, score_cutoff: int = 92) -> Tuple[str, int]:
     if not query_norm or not choices:
         return "", 0
-    # token_set_ratio is great for addresses where order varies slightly
-    res = process.extractOne(query_norm, choices, scorer=fuzz.token_set_ratio, score_cutoff=score_cutoff)
-    if not res:
+
+    if _HAS_RAPIDFUZZ:
+        res = process.extractOne(query_norm, choices, scorer=fuzz.token_set_ratio, score_cutoff=score_cutoff)
+        if not res:
+            return "", 0
+        match_str, score, _ = res
+        return match_str, int(score)
+
+    # difflib fallback: score 0-100
+    best = difflib.get_close_matches(query_norm, choices, n=1, cutoff=score_cutoff / 100.0)
+    if not best:
         return "", 0
-    match_str, score, _ = res
-    return match_str, int(score)
+    match_str = best[0]
+    ratio = difflib.SequenceMatcher(None, query_norm, match_str).ratio()
+    score = int(round(ratio * 100))
+    if score < score_cutoff:
+        return "", 0
+    return match_str, score
 
 
 def merge_notices_into_leads(
@@ -325,17 +332,11 @@ def merge_notices_into_leads(
     Foreclosure merge priority:
       1) PID match (if pid_raw_guess present)
       2) Exact normalized address match
-      3) Fuzzy address match (when PID not present / no exact match)
+      3) Fuzzy address match (when PID missing / no exact match)
 
-    When fuzzy match is used, we set:
+    When fuzzy match is used:
       - foreclosure_match_method = "fuzzy_address"
       - foreclosure_fuzzy_score = <0-100>
-
-    Exact addr match sets:
-      - foreclosure_match_method = "exact_address"
-
-    PID match sets:
-      - foreclosure_match_method = "pid"
     """
     df = leads_df.copy()
 
@@ -350,7 +351,7 @@ def merge_notices_into_leads(
     df["foreclosure_sale_date"] = ""
     df["foreclosure_notice_url"] = ""
     df["foreclosure_notice_details"] = ""
-    df["foreclosure_match_method"] = ""           # pid | exact_address | fuzzy_address
+    df["foreclosure_match_method"] = ""   # pid | exact_address | fuzzy_address
     df["foreclosure_fuzzy_score"] = 0
 
     # Probate enrichment fields
@@ -370,7 +371,6 @@ def merge_notices_into_leads(
         f["pid_raw_guess"] = f.get("pid_raw_guess", "").astype(str).map(_digits_only)
         f["_norm_addr_key"] = f.get("norm_key", "").astype(str)
 
-        # Build fuzzy index for leads
         choices, norm_to_idx = _build_fuzzy_index(df)
 
         # 1) PID match
@@ -385,7 +385,7 @@ def merge_notices_into_leads(
         df.loc[hit_mask, "foreclosure_match_method"] = "pid"
         df.loc[hit_mask, "foreclosure_fuzzy_score"] = 0
 
-        # 2) Exact normalized address match (for those not already matched)
+        # 2) Exact normalized address match
         addr_hits = f[f["_norm_addr_key"].astype(bool)].drop_duplicates(subset=["_norm_addr_key"])
         addr_map = addr_hits.set_index("_norm_addr_key").to_dict(orient="index") if not addr_hits.empty else {}
 
@@ -397,22 +397,14 @@ def merge_notices_into_leads(
         df.loc[hit_mask2, "foreclosure_match_method"] = "exact_address"
         df.loc[hit_mask2, "foreclosure_fuzzy_score"] = 0
 
-        # 3) Fuzzy address match for remaining foreclosure notices that:
-        #    - do NOT have a PID or did not match PID
-        #    - do not exact match
-        # We do this by iterating foreclosure signals and assigning them to best lead match (greedy).
-        unmatched_lead_mask = ~df["has_mortgage_foreclosure_notice"]
-        if unmatched_lead_mask.any() and choices:
-            # Create a working map from normalized lead address -> lead row index
-            # (we can later check whether that lead row is still unmatched)
+        # 3) Fuzzy address match (greedy attach to first unmatched best match)
+        if choices:
             for _, sig in f.iterrows():
                 q = str(sig.get("_norm_addr_key", "")).strip()
                 if not q:
                     continue
 
-                # If this signal has PID, we've already tried PID match; still allow fuzzy for non-matching PID
-                # (because parcel formats often differ). That’s acceptable.
-                best_norm, score = _fuzzy_best_match(q, choices, score_cutoff=fuzzy_score_cutoff)
+                best_norm, score = _fuzzy_best_match(q, choices, score_cutoff=int(fuzzy_score_cutoff))
                 if not best_norm or score <= 0:
                     continue
 
@@ -420,7 +412,6 @@ def merge_notices_into_leads(
                 if lead_i is None:
                     continue
 
-                # Only attach if that lead is not already matched to foreclosure
                 if bool(df.loc[lead_i, "has_mortgage_foreclosure_notice"]):
                     continue
 
@@ -494,15 +485,6 @@ def apply_notice_scoring(df: pd.DataFrame) -> pd.DataFrame:
         mask = d["has_mortgage_foreclosure_notice"].fillna(False)
         d.loc[mask, "score"] = pd.to_numeric(d.loc[mask, "score"], errors="coerce").fillna(0) + 35
         d.loc[mask, "score_notes"] = d.loc[mask, "score_notes"].map(lambda s: add_note(s, "Mortgage foreclosure notice"))
-
-        # add fuzzy detail note (optional)
-        if "foreclosure_match_method" in d.columns and "foreclosure_fuzzy_score" in d.columns:
-            fm = d["foreclosure_match_method"].fillna("")
-            fs = pd.to_numeric(d["foreclosure_fuzzy_score"], errors="coerce").fillna(0).astype(int)
-            fuzzy_mask = (fm == "fuzzy_address") & mask
-            d.loc[fuzzy_mask, "score_notes"] = d.loc[fuzzy_mask, "score_notes"].astype(str) + d.loc[fuzzy_mask].apply(
-                lambda r: f" (fuzzy addr {int(r.get('foreclosure_fuzzy_score', 0))})", axis=1
-            )
 
     if "has_probate_notice" in d.columns:
         mask = d["has_probate_notice"].fillna(False)
