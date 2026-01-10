@@ -16,17 +16,19 @@ from hennepin_mpls_deal_crawler import (
     digits_only,
 )
 
+from signals_startribune import (
+    NoticeConfig,
+    fetch_startribune_foreclosure_notices,
+    fetch_startribune_probate_notices,
+    merge_notices_into_leads,
+    apply_notice_scoring,
+)
+
 st.set_page_config(page_title="Wholesale Property Finder", layout="wide")
 
-# -------------------------
-# Router via query params
-# -------------------------
 view = (st.query_params.get("view") or "results").strip().lower()
 pid_qp = (st.query_params.get("pid") or "").strip()
 
-# -------------------------
-# Sidebar (search inputs only)
-# -------------------------
 default_city_list = [
     "Minneapolis", "Bloomington", "Brooklyn Park", "Brooklyn Center", "Richfield",
     "Edina", "St. Louis Park", "Plymouth", "Golden Valley", "Eden Prairie",
@@ -46,6 +48,13 @@ with st.sidebar:
     enable_vbr = st.checkbox("Vacant/Condemned (VBR)", value=True)
     enable_viol = st.checkbox("Violations", value=True)
 
+    st.subheader("Extra distress signals (statewide notices)")
+    enable_mtg_notice = st.checkbox("Mortgage foreclosure notices (Star Tribune)", value=False)
+    enable_probate_notice = st.checkbox("Probate notices (Star Tribune)", value=False)
+
+    notice_limit = st.slider("Notices per source (limit)", 24, 240, 240, 24)
+    notice_age = st.slider("Max notice age (days)", 7, 365, 90, 7)
+
     top_n = st.slider("Top N leads", 100, 5000, 1000, 100)
 
     st.divider()
@@ -53,36 +62,26 @@ with st.sidebar:
     page_size = st.slider("Rows per page", 10, 200, 50, 10)
     show_debug = st.checkbox("Show debug logs", value=False)
 
-# -------------------------
-# Session state
-# -------------------------
 if "results_df" not in st.session_state:
     st.session_state.results_df = None
 
-# Property type filters (post-search)
 if "property_type_filter_results" not in st.session_state:
     st.session_state.property_type_filter_results = []
 if "property_type_filter_saved" not in st.session_state:
     st.session_state.property_type_filter_saved = []
 
-# Saved list + interaction cache
 if "saved_pids" not in st.session_state:
-    st.session_state.saved_pids = set()  # pid_raw digits-only
+    st.session_state.saved_pids = set()
 
 if "interaction_cache" not in st.session_state:
-    # pid_raw -> {"zillow_clicked_at": "...", "comps_opened_at": "...", "saved_at": "...", "unsaved_at": "..."}
     st.session_state.interaction_cache = {}
 
-# One-shot JS opener (used to open Zillow without leaving the page)
 if "js_open_url" not in st.session_state:
     st.session_state.js_open_url = ""
 if "js_open_nonce" not in st.session_state:
     st.session_state.js_open_nonce = 0
 
 
-# -------------------------
-# Helpers
-# -------------------------
 def now_ts() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -147,7 +146,7 @@ def _header_nav():
             st.query_params["view"] = "saved"
             st.rerun()
     with right:
-        st.caption("Tip: Zillow opens in a new tab without leaving the results page; clicks are timestamped.")
+        st.caption("Tip: Zillow opens in a new tab without leaving the page; clicks are timestamped.")
 
 
 def _save_toggle(pid_raw: str) -> bool:
@@ -165,31 +164,21 @@ def _save_toggle(pid_raw: str) -> bool:
 
 
 def _queue_js_open(url: str):
-    """
-    Queue a one-shot JS open in new tab; executed at top of Results/Saved render.
-    """
     st.session_state.js_open_url = url
     st.session_state.js_open_nonce += 1
 
 
 def _flush_js_open():
-    """
-    If a URL is queued, inject JS to open it in a new tab and then clear it.
-    This runs within the same page render, so user stays on Results/Saved view.
-    """
     url = st.session_state.get("js_open_url", "")
     nonce = st.session_state.get("js_open_nonce", 0)
     if not url:
         return
 
-    # Open a new tab and do not navigate the current page.
-    # Use nonce to ensure the component rerenders even for the same URL.
     components.html(
         f"""
         <script>
           (function() {{
             const url = {url!r};
-            // Try to open a new tab. Some browsers block popups if not triggered by direct click.
             window.open(url, "_blank", "noopener,noreferrer");
           }})();
         </script>
@@ -197,8 +186,6 @@ def _flush_js_open():
         """,
         height=0,
     )
-
-    # Clear after firing so it doesn't repeat on reruns
     st.session_state.js_open_url = ""
 
 
@@ -216,14 +203,22 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
 
     county_url = hennepin_pins_pid_url(pid_raw)
 
-    # Cached interaction timestamps
     z_clicked = get_interaction(pid_raw, "zillow_clicked_at")
     c_opened = get_interaction(pid_raw, "comps_opened_at")
     saved_at = get_interaction(pid_raw, "saved_at")
     is_saved = pid_raw in st.session_state.saved_pids
 
-    # Build Zillow URL from row data (no extra fetch, faster & works inline)
     z_url = zillow_search_url(addr, city, "MN", zipc)
+
+    # Notice signals
+    has_fc = bool(row.get("has_mortgage_foreclosure_notice", False))
+    fc_date = str(row.get("foreclosure_sale_date", "")).strip()
+    fc_url = str(row.get("foreclosure_notice_url", "")).strip()
+
+    has_pb = bool(row.get("has_probate_notice", False))
+    pb_file = str(row.get("probate_court_file_no", "")).strip()
+    pb_dec = str(row.get("probate_decedent_name", "")).strip()
+    pb_url = str(row.get("probate_notice_url", "")).strip()
 
     with st.container(border=True):
         c1, c2, c3, c4, c5, c6 = st.columns([6, 2, 1, 1, 1, 1])
@@ -232,6 +227,14 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
             st.markdown(f"### {addr}, {city} {zipc}")
             st.write(f"**PID:** {pid_fmt}  •  **Type:** {ptype or '—'}  •  **Owner:** {owner}")
             st.write(f"**Score:** {score}  •  {notes}")
+
+            badges = []
+            if has_fc:
+                badges.append(f"🚨 Foreclosure Notice{' (Sale: ' + fc_date + ')' if fc_date else ''}")
+            if has_pb:
+                badges.append(f"⚖️ Probate Notice{(' ('+pb_file+')') if pb_file else ''}")
+            if badges:
+                st.info(" | ".join(badges))
 
             meta = []
             if z_clicked:
@@ -243,6 +246,15 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
             if meta:
                 st.caption(" | ".join(meta))
 
+            # Audit links
+            link_row = []
+            if has_fc and fc_url:
+                link_row.append(("Foreclosure source", fc_url))
+            if has_pb and pb_url:
+                link_row.append(("Probate source", pb_url))
+            if link_row:
+                st.caption(" • ".join([f"[{t}]({u})" for t, u in link_row]))
+
         with c2:
             st.write(f"**Market Value:** {row.get('market_value_total', '')}")
             st.write(f"**Last Sale:** {row.get('sale_date_raw', '')}")
@@ -252,7 +264,6 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
             st.link_button("🏛️", county_url, help="Open Hennepin County property search (PID)")
 
         with c4:
-            # ✅ One click: audit + open Zillow (new tab) without changing Streamlit page
             if st.button("🔎", key=f"z_{idx_key}", help="Open Zillow (new tab) and log timestamp"):
                 log_interaction(pid_raw, "zillow_clicked_at")
                 _queue_js_open(z_url)
@@ -275,23 +286,51 @@ def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True)
                     st.rerun()
 
 
-# -------------------------
-# Views
-# -------------------------
+def _apply_notice_sources(df: pd.DataFrame):
+    """
+    Fetch and merge foreclosure/probate notices into df if enabled.
+    """
+    if df is None or df.empty:
+        return df
+
+    cfg = NoticeConfig(limit=notice_limit, max_age_days=notice_age, sleep_s=0.25)
+
+    logs = []
+    def log(msg: str):
+        logs.append(msg)
+        if show_debug:
+            st.write(msg)
+
+    forecl_df = pd.DataFrame()
+    probate_df = pd.DataFrame()
+
+    if enable_mtg_notice:
+        with st.spinner("Pulling mortgage foreclosure notices…"):
+            forecl_df = fetch_startribune_foreclosure_notices(cfg, logger=log)
+
+    if enable_probate_notice:
+        with st.spinner("Pulling probate notices…"):
+            probate_df = fetch_startribune_probate_notices(cfg, logger=log)
+
+    if (forecl_df is None or forecl_df.empty) and (probate_df is None or probate_df.empty):
+        return df
+
+    merged = merge_notices_into_leads(df, forecl_df, probate_df)
+    merged = apply_notice_scoring(merged)
+    return merged
+
+
 def render_results():
     st.title("Wholesale Property Finder — Hennepin County MN")
-    st.caption("Actions: 🏛️ county • 🔎 Zillow (opens new tab, tracked) • 📊 comps (tracked) • ☆/★ save")
+    st.caption("Actions: 🏛️ county • 🔎 Zillow (new tab, tracked) • 📊 comps (tracked) • ☆/★ save")
 
     _header_nav()
-
-    # Fire any queued JS open (keeps user on this page)
     _flush_js_open()
 
     run_btn = st.button("Run crawler", type="primary")
 
     if run_btn:
         logs = []
-
         def log(msg: str):
             logs.append(msg)
             if show_debug:
@@ -305,16 +344,12 @@ def render_results():
                     cities=cities if cities else None,
                     enable_vbr=enable_vbr,
                     enable_viol=enable_viol,
-                    property_types=None,  # property type filtering happens after search now
+                    property_types=None,
                     top_n=top_n,
                     out_csv=tmp.name,
                     logger=log,
                 )
-                df = pd.read_csv(
-                    tmp.name,
-                    dtype={"pid": "string", "pid_raw": "string"},
-                    keep_default_na=False,
-                )
+                df = pd.read_csv(tmp.name, dtype={"pid": "string", "pid_raw": "string"}, keep_default_na=False)
             finally:
                 try:
                     os.unlink(tmp.name)
@@ -322,6 +357,10 @@ def render_results():
                     pass
 
         df = _enforce_pid_columns(df)
+
+        # 🔥 NEW: apply foreclosure + probate sources (optional)
+        df = _apply_notice_sources(df)
+
         st.session_state.results_df = df
         st.session_state.property_type_filter_results = []
 
@@ -329,15 +368,12 @@ def render_results():
     if df is None:
         st.info("Click **Run crawler** to generate results.")
         return
-
     if df.empty:
         st.warning("No results returned. Try changing city or Minneapolis stacking options.")
         return
 
-    # Static property type filter above results (limited to returned values)
     st.markdown("## Property Type Filter")
     pt_options = _property_type_options(df)
-
     if pt_options:
         st.session_state.property_type_filter_results = [
             x for x in st.session_state.property_type_filter_results if x in pt_options
@@ -349,7 +385,6 @@ def render_results():
         )
         df_ui = _apply_property_type_filter(df, st.session_state.property_type_filter_results)
     else:
-        st.caption("No property_type field available in these results.")
         df_ui = df
 
     st.divider()
@@ -382,11 +417,7 @@ def render_results():
 
 def render_saved():
     st.title("⭐ Saved Properties")
-    st.caption("Only properties you’ve starred appear here.")
-
     _header_nav()
-
-    # Fire any queued JS open here too (if user clicks Zillow from saved list)
     _flush_js_open()
 
     saved = sorted(st.session_state.saved_pids)
@@ -397,7 +428,6 @@ def render_saved():
     df = st.session_state.results_df
     if df is None or df.empty:
         st.warning("No results are loaded yet. Run the crawler first so the app can display saved details.")
-        st.caption("Your saved PIDs are stored for this session.")
         st.write(saved)
         return
 
@@ -406,13 +436,11 @@ def render_saved():
 
     if df_saved.empty:
         st.warning("None of your saved PIDs are in the currently loaded results.")
-        st.caption("Run a new search that includes those properties, or keep saving new ones from Results.")
         st.write(saved)
         return
 
     st.markdown("## Property Type Filter (Saved)")
     pt_options = _property_type_options(df_saved)
-
     if pt_options:
         st.session_state.property_type_filter_saved = [
             x for x in st.session_state.property_type_filter_saved if x in pt_options
@@ -455,11 +483,9 @@ def render_comps(pid_any: str):
     pid_fmt = format_pid(pid_raw)
 
     st.title("Comparable Analysis (County + Zillow link)")
-    st.caption("County parcel snapshot + nearby county comps. Zillow is link-out only (no scraping).")
-
     _header_nav()
 
-    colA, colB, colC = st.columns([2, 2, 6])
+    colA, colB, _ = st.columns([2, 2, 8])
     with colA:
         st.link_button("🏛️ County Property Page", hennepin_pins_pid_url(pid_raw))
     with colB:
@@ -493,15 +519,10 @@ def render_comps(pid_any: str):
     st.subheader(f"{addr}, {city} {zipc}")
     st.write(f"**PID:** {pid_fmt}  •  **Type:** {ptype or '—'}  •  **Owner:** {owner or '—'}")
 
-    st.caption(
-        " | ".join(
-            [x for x in [
-                f"🔎 Zillow clicked: {get_interaction(pid_raw, 'zillow_clicked_at')}" if get_interaction(pid_raw, "zillow_clicked_at") else "",
-                f"📊 Comps opened: {get_interaction(pid_raw, 'comps_opened_at')}" if get_interaction(pid_raw, "comps_opened_at") else "",
-                f"⭐ Saved: {get_interaction(pid_raw, 'saved_at')}" if get_interaction(pid_raw, "saved_at") else "",
-            ] if x]
-        )
-    )
+    if st.button("🔎 Open Zillow (tracked, new tab)"):
+        log_interaction(pid_raw, "zillow_clicked_at")
+        _queue_js_open(z_url)
+        st.rerun()
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("County Market Value", f"${mv:,.0f}" if isinstance(mv, (int, float)) else str(mv))
@@ -509,14 +530,8 @@ def render_comps(pid_any: str):
     k3.metric("Last Sale Date", sale_date or "—")
     k4.metric("Property Type", ptype or "—")
 
-    # On comps page, we still can open Zillow in new tab without leaving the page
-    if st.button("🔎 Open Zillow (tracked, new tab)"):
-        log_interaction(pid_raw, "zillow_clicked_at")
-        _queue_js_open(z_url)
-        st.rerun()
-
     st.divider()
-    st.subheader("Nearby County Comps (cross-check)")
+    st.subheader("Nearby County Comps")
 
     c1, c2, c3, _ = st.columns([2, 2, 2, 4])
     with c1:
@@ -544,20 +559,7 @@ def render_comps(pid_any: str):
 
     st.dataframe(comps_df, use_container_width=True)
 
-    st.divider()
-    st.subheader("Next steps (wholesale workflow)")
-    st.markdown(
-        """
-- Verify motivation stack: delinquency years, absentee, forfeiture indicators, and (optional) city signals.
-- Confirm condition: drive-by + your buyer pool notes (Zillow link is for viewing only).
-- Offer math: **ARV × (0.70–0.80) − Repairs − Assignment fee** (tune to your buyer pool).
-"""
-    )
 
-
-# -------------------------
-# Route
-# -------------------------
 if view == "saved":
     render_saved()
 elif view == "comps":
