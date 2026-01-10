@@ -1,5 +1,7 @@
+# app.py
 import os
 import tempfile
+import urllib.parse
 import pandas as pd
 import streamlit as st
 
@@ -8,10 +10,9 @@ from hennepin_mpls_deal_crawler import (
     hennepin_pins_pid_url,
     get_parcel_by_pid,
     get_comps_for_pid,
+    format_pid,
+    digits_only,
 )
-
-# NorthstarMLS RESO Web API client (you added this file)
-from northstar_mls_client import NorthstarResoClient
 
 st.set_page_config(page_title="Wholesale Property Finder", layout="wide")
 
@@ -22,7 +23,7 @@ view = (st.query_params.get("view") or "results").strip().lower()
 pid_qp = (st.query_params.get("pid") or "").strip()
 
 # -------------------------
-# Shared sidebar
+# Sidebar
 # -------------------------
 default_city_list = [
     "Minneapolis", "Bloomington", "Brooklyn Park", "Brooklyn Center", "Richfield",
@@ -45,9 +46,16 @@ with st.sidebar:
     page_size = st.slider("Rows per page", 10, 200, 50, 10)
     show_debug = st.checkbox("Show debug logs", value=False)
 
-# Persist results
 if "results_df" not in st.session_state:
     st.session_state.results_df = None
+
+
+def zillow_search_url(address: str, city: str, state: str, zipc: str) -> str:
+    """
+    Safe: link-out only (no scraping). Uses Zillow search results for the address.
+    """
+    q = f"{address}, {city}, {state} {zipc}".strip().strip(",")
+    return f"https://www.zillow.com/homes/{urllib.parse.quote_plus(q)}_rb/"
 
 
 # -------------------------
@@ -57,7 +65,7 @@ def render_results():
     st.title("Wholesale Property Finder — Hennepin County MN (+ optional Minneapolis stacking)")
     st.caption(
         "Generate a prioritized lead list from Hennepin distress signals and optionally stack Minneapolis datasets. "
-        "Each result includes actions: 🏛️ county property page + 📊 comparable analysis (with NorthstarMLS details if available)."
+        "Each result includes actions: 🏛️ county property page + 🔎 Zillow link + 📊 comps."
     )
 
     run_btn = st.button("Run crawler", type="primary")
@@ -81,7 +89,7 @@ def render_results():
                     out_csv=tmp.name,
                     logger=log,
                 )
-                # ✅ Keep PID text formatting
+                # Force pid columns as text so formatting isn't lost
                 df = pd.read_csv(
                     tmp.name,
                     dtype={"pid": "string", "pid_raw": "string"},
@@ -92,6 +100,11 @@ def render_results():
                     os.unlink(tmp.name)
                 except Exception:
                     pass
+
+        # Enforce PID format in-memory too (belt + suspenders)
+        if "pid_raw" in df.columns:
+            df["pid_raw"] = df["pid_raw"].astype(str).map(digits_only)
+            df["pid"] = df["pid_raw"].map(format_pid)
 
         st.session_state.results_df = df
 
@@ -110,7 +123,6 @@ def render_results():
 
     st.subheader("Results")
 
-    # Pagination
     total = len(df)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
@@ -121,8 +133,10 @@ def render_results():
     st.caption(f"Showing rows {start+1:,}–{end:,} of {total:,}")
 
     for idx, row in slice_df.iterrows():
-        pid = str(row.get("pid", "")).strip()          # formatted ##-###-##-###-####
-        pid_raw = str(row.get("pid_raw", "")).strip()  # digits-only
+        pid_raw = str(row.get("pid_raw", "")).strip()
+        pid_raw = digits_only(pid_raw)
+        pid = format_pid(pid_raw)
+
         addr = str(row.get("situs_address", "")).strip()
         city = str(row.get("situs_city", "")).strip()
         zipc = str(row.get("situs_zip", "")).strip()
@@ -130,10 +144,11 @@ def render_results():
         score = row.get("score", "")
         notes = str(row.get("score_notes", ""))
 
-        county_url = hennepin_pins_pid_url(pid_raw or pid)
+        county_url = hennepin_pins_pid_url(pid_raw)
+        z_url = zillow_search_url(addr, city, "MN", zipc)
 
         with st.container(border=True):
-            c1, c2, c3, c4 = st.columns([6, 2, 1, 1])
+            c1, c2, c3, c4, c5 = st.columns([6, 2, 1, 1, 1])
 
             with c1:
                 st.markdown(f"### {addr}, {city} {zipc}")
@@ -149,39 +164,39 @@ def render_results():
                 st.link_button("🏛️", county_url, help="Open Hennepin County property search (PID)")
 
             with c4:
-                if st.button("📊", key=f"comp_{pid}_{idx}", help="Open comparable analysis"):
+                st.link_button("🔎", z_url, help="Open Zillow (search) for this address")
+
+            with c5:
+                if st.button("📊", key=f"comp_{pid_raw}_{idx}", help="Open comparable analysis"):
                     st.query_params["view"] = "comps"
-                    # Pass raw digits for best reliability with ArcGIS/MLS
-                    st.query_params["pid"] = pid_raw or pid
+                    st.query_params["pid"] = pid_raw
                     st.rerun()
 
 
 # -------------------------
-# Comparable analysis view (County + NorthstarMLS)
+# Comparable analysis view
 # -------------------------
 def render_comps(pid_any: str):
-    st.title("Comparable Analysis (County + NorthstarMLS)")
-    st.caption(
-        "County parcel snapshot + NorthstarMLS listing details and photos (requires valid Northstar credentials/permissions)."
-    )
+    pid_raw = digits_only(pid_any)
+    pid_fmt = format_pid(pid_raw)
+
+    st.title("Comparable Analysis (County + Zillow link)")
+    st.caption("County parcel snapshot + nearby county comps. Zillow opens in a new tab via link-out (no scraping).")
 
     colA, colB, colC = st.columns([2, 2, 6])
     with colA:
-        st.link_button("🏛️ County Property Page", hennepin_pins_pid_url(pid_any))
+        st.link_button("🏛️ County Property Page", hennepin_pins_pid_url(pid_raw))
     with colB:
         if st.button("⬅️ Back to Results"):
             st.query_params.clear()
             st.rerun()
 
-    if not pid_any:
+    if not pid_raw:
         st.warning("No PID provided. Go back to Results and click 📊 on a property.")
         return
 
-    # -------------------------
-    # County parcel (subject)
-    # -------------------------
     with st.spinner("Loading county parcel…"):
-        subj = get_parcel_by_pid(pid_any)
+        subj = get_parcel_by_pid(pid_raw)
 
     if subj is None:
         st.error("Could not load the subject property from the parcel service.")
@@ -200,7 +215,11 @@ def render_comps(pid_any: str):
     forfeit = subj.get("forfeited", False)
     absentee = subj.get("absentee", False)
 
+    # Zillow link for the selected property
+    z_url = zillow_search_url(addr, city, "MN", zipc)
+
     st.subheader(f"{addr}, {city} {zipc}")
+    st.write(f"**PID:** {pid_fmt}")
 
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("County Market Value", f"${mv:,.0f}" if isinstance(mv, (int, float)) else str(mv))
@@ -221,109 +240,11 @@ def render_comps(pid_any: str):
     if flags:
         st.info(" • ".join(flags))
 
-    st.divider()
-
-    # -------------------------
-    # NorthstarMLS section
-    # -------------------------
-    st.subheader("NorthstarMLS Listing Details (if matched)")
-    st.caption("This section requires NORTHSTAR_CLIENT_ID and NORTHSTAR_CLIENT_SECRET set in your environment/secrets.")
-
-    mls_error = None
-    mls_property = None
-    mls_media = []
-
-    with st.spinner("Searching NorthstarMLS by address…"):
-        try:
-            mls = NorthstarResoClient()
-
-            # Search by UnparsedAddress contains + City + PostalCode
-            matches = mls.search_property_by_address(
-                unparsed_address=addr,
-                city=city,
-                postal_code=zipc,
-                top=5,
-            )
-
-            if matches:
-                # Basic pick: first match
-                candidate = matches[0]
-                listing_key = str(candidate.get("ListingKey") or "").strip()
-
-                # Fetch full record (try expand Media)
-                if listing_key:
-                    mls_property = mls.get_property_by_listing_key(listing_key, expand_media=True)
-
-                    # Pull Media
-                    if isinstance(mls_property, dict) and isinstance(mls_property.get("Media"), list):
-                        mls_media = mls_property.get("Media") or []
-                    else:
-                        mls_media = mls.get_media_for_listing_key(listing_key, top=200)
-                else:
-                    # If ListingKey missing for some reason, still show candidate
-                    mls_property = candidate
-
-        except Exception as e:
-            mls_error = str(e)
-
-    if mls_error:
-        st.warning(
-            "NorthstarMLS data is not available right now. This typically means credentials/permissions are missing "
-            "or the API access is not enabled for your account."
-        )
-        st.code(mls_error)
-
-    if not mls_property:
-        st.info("No NorthstarMLS listing matched this address (or it’s not available via your permissions).")
-    else:
-        # Photos
-        photo_urls = []
-        for m in (mls_media or []):
-            u = m.get("MediaURL") or m.get("MediaUrl") or m.get("MediaUri")
-            if u:
-                photo_urls.append(u)
-
-        if photo_urls:
-            st.write("### Photos")
-            # Render up to 30 photos
-            st.image(photo_urls[:30], use_container_width=True)
-        else:
-            st.info("No MediaURL values were returned for this listing (or media is not exposed to your feed).")
-
-        # Curated quick facts (Zillow-ish)
-        def g(*keys):
-            for k in keys:
-                if k in mls_property and mls_property[k] not in (None, ""):
-                    return mls_property[k]
-            return None
-
-        st.write("### Key MLS Fields (curated)")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("List Price", g("ListPrice", "OriginalListPrice") or "—")
-        c2.metric("Beds", g("BedroomsTotal", "BedsTotal") or "—")
-        c3.metric("Baths", g("BathroomsTotalInteger", "BathroomsTotal") or "—")
-        c4.metric("Sq Ft", g("LivingArea", "LivingAreaTotal") or "—")
-
-        st.write(
-            f"**Status:** {g('StandardStatus','MlsStatus') or '—'}  •  "
-            f"**DOM:** {g('DaysOnMarket','DaysOnMarketCumulative') or '—'}  •  "
-            f"**Year Built:** {g('YearBuilt') or '—'}"
-        )
-
-        # Full raw payload (as you requested: include ALL MLS info they provide)
-        st.write("### All MLS Fields (raw)")
-        st.json(mls_property)
-
-        if mls_media:
-            st.write("### All MLS Media Records (raw)")
-            st.json(mls_media)
+    st.link_button("Open on Zillow (search)", z_url)
 
     st.divider()
-
-    # -------------------------
-    # County comps (fallback / cross-check)
-    # -------------------------
     st.subheader("Nearby County Comps (cross-check)")
+
     c1, c2, c3, _ = st.columns([2, 2, 2, 4])
     with c1:
         radius_m = st.slider("Radius (meters)", 200, 2000, 800, 100)
@@ -334,7 +255,7 @@ def render_comps(pid_any: str):
 
     with st.spinner("Finding county comps…"):
         comps_df = get_comps_for_pid(
-            pid_any=pid_any,
+            pid_any=pid_raw,
             radius_m=radius_m,
             max_comps=max_comps,
             value_band_pct=value_band,
@@ -354,8 +275,8 @@ def render_comps(pid_any: str):
     st.subheader("Next steps (wholesale workflow)")
     st.markdown(
         """
-- Validate motivation: delinquency years, absentee, forfeiture indicators, and any city violations (if stacked).
-- Validate condition: MLS photos, drive-by, and neighborhood comps.
+- Verify motivation stack: delinquency years, absentee, forfeiture indicators, and any city violations (if stacked).
+- Confirm condition: drive-by + photos/notes from your buyer pool (Zillow link is for viewing only).
 - Offer math: **ARV × (0.70–0.80) − Repairs − Assignment fee** (tune to your buyer pool).
 """
     )
