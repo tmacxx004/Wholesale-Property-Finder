@@ -137,6 +137,33 @@ def _extract_probate_rep_address(text: str) -> str:
     return ""
 
 
+# ✅ NEW: Mortgage amount extractor
+def _extract_mortgage_on_notice_amount(text: str) -> int:
+    """
+    Looks for: 'MORTGAGE ON THE DATE OF THE NOTICE: $123,456.78'
+    Returns integer dollars (rounded down) or 0 if not found.
+    """
+    # Common variants: colon, dash, or whitespace separators
+    # Capture $ amounts with commas and optional cents
+    m = re.search(
+        r"MORTGAGE\s+ON\s+THE\s+DATE\s+OF\s+THE\s+NOTICE\s*[:\-]?\s*\$?\s*([0-9][0-9,]*\.?\d{0,2})",
+        text,
+        re.I,
+    )
+    if not m:
+        return 0
+    raw = m.group(1)
+    raw = raw.replace(",", "").strip()
+    try:
+        # keep dollars as int
+        val = float(raw)
+        if val < 0:
+            return 0
+        return int(val)
+    except Exception:
+        return 0
+
+
 @dataclass
 class NoticeConfig:
     limit: int = 120
@@ -180,6 +207,9 @@ def fetch_startribune_foreclosure_notices(
             tax_parcel = _extract_tax_parcel(text)
             sale_date = _try_parse_sale_date(text)
 
+            # ✅ NEW: mortgage amount
+            mortgage_amount = _extract_mortgage_on_notice_amount(text)
+
             if not addr:
                 continue
 
@@ -204,8 +234,14 @@ def fetch_startribune_foreclosure_notices(
                     "tax_parcel_text": tax_parcel,
                     "pid_raw_guess": _digits_only(tax_parcel),
                     "norm_key": _norm_addr(addr),
+                    "mortgage_amount": mortgage_amount,  # ✅ NEW
                     "signal_strength": 35,
-                    "signal_details": f"Foreclosure notice; sale_date={sale_date or 'unknown'}; county={county or 'unknown'}",
+                    "signal_details": (
+                        f"Foreclosure notice; sale_date={sale_date or 'unknown'}; "
+                        f"county={county or 'unknown'}; mortgage_on_notice=${mortgage_amount:,}"
+                        if mortgage_amount
+                        else f"Foreclosure notice; sale_date={sale_date or 'unknown'}; county={county or 'unknown'}"
+                    ),
                 }
             )
 
@@ -309,7 +345,6 @@ def _fuzzy_best_match(query_norm: str, choices: list[str], *, score_cutoff: int 
         match_str, score, _ = res
         return match_str, int(score)
 
-    # difflib fallback: score 0-100
     best = difflib.get_close_matches(query_norm, choices, n=1, cutoff=score_cutoff / 100.0)
     if not best:
         return "", 0
@@ -330,13 +365,13 @@ def merge_notices_into_leads(
 ) -> pd.DataFrame:
     """
     Foreclosure merge priority:
-      1) PID match (if pid_raw_guess present)
+      1) PID match
       2) Exact normalized address match
-      3) Fuzzy address match (when PID missing / no exact match)
+      3) Fuzzy address match
 
-    When fuzzy match is used:
-      - foreclosure_match_method = "fuzzy_address"
-      - foreclosure_fuzzy_score = <0-100>
+    ✅ Also merges foreclosure mortgage amount (from phrase
+    'MORTGAGE ON THE DATE OF THE NOTICE') into:
+      - foreclosure_mortgage_amount
     """
     df = leads_df.copy()
 
@@ -351,8 +386,11 @@ def merge_notices_into_leads(
     df["foreclosure_sale_date"] = ""
     df["foreclosure_notice_url"] = ""
     df["foreclosure_notice_details"] = ""
-    df["foreclosure_match_method"] = ""   # pid | exact_address | fuzzy_address
+    df["foreclosure_match_method"] = ""  # pid | exact_address | fuzzy_address
     df["foreclosure_fuzzy_score"] = 0
+
+    # ✅ NEW: mortgage amount on foreclosure notice
+    df["foreclosure_mortgage_amount"] = 0
 
     # Probate enrichment fields
     df["has_probate_notice"] = False
@@ -370,6 +408,7 @@ def merge_notices_into_leads(
         f = forecl_df.copy()
         f["pid_raw_guess"] = f.get("pid_raw_guess", "").astype(str).map(_digits_only)
         f["_norm_addr_key"] = f.get("norm_key", "").astype(str)
+        f["mortgage_amount"] = pd.to_numeric(f.get("mortgage_amount", 0), errors="coerce").fillna(0).astype(int)
 
         choices, norm_to_idx = _build_fuzzy_index(df)
 
@@ -382,6 +421,7 @@ def merge_notices_into_leads(
         df.loc[hit_mask, "foreclosure_sale_date"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("event_date", ""))
         df.loc[hit_mask, "foreclosure_notice_url"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("source_url", ""))
         df.loc[hit_mask, "foreclosure_notice_details"] = df.loc[hit_mask, "pid_raw"].map(lambda x: pid_map.get(x, {}).get("signal_details", ""))
+        df.loc[hit_mask, "foreclosure_mortgage_amount"] = df.loc[hit_mask, "pid_raw"].map(lambda x: int(pid_map.get(x, {}).get("mortgage_amount", 0) or 0))
         df.loc[hit_mask, "foreclosure_match_method"] = "pid"
         df.loc[hit_mask, "foreclosure_fuzzy_score"] = 0
 
@@ -394,10 +434,11 @@ def merge_notices_into_leads(
         df.loc[hit_mask2, "foreclosure_sale_date"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("event_date", ""))
         df.loc[hit_mask2, "foreclosure_notice_url"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("source_url", ""))
         df.loc[hit_mask2, "foreclosure_notice_details"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: addr_map.get(k, {}).get("signal_details", ""))
+        df.loc[hit_mask2, "foreclosure_mortgage_amount"] = df.loc[hit_mask2, "_norm_addr_key"].map(lambda k: int(addr_map.get(k, {}).get("mortgage_amount", 0) or 0))
         df.loc[hit_mask2, "foreclosure_match_method"] = "exact_address"
         df.loc[hit_mask2, "foreclosure_fuzzy_score"] = 0
 
-        # 3) Fuzzy address match (greedy attach to first unmatched best match)
+        # 3) Fuzzy address match
         if choices:
             for _, sig in f.iterrows():
                 q = str(sig.get("_norm_addr_key", "")).strip()
@@ -419,6 +460,7 @@ def merge_notices_into_leads(
                 df.loc[lead_i, "foreclosure_sale_date"] = str(sig.get("event_date", "") or "")
                 df.loc[lead_i, "foreclosure_notice_url"] = str(sig.get("source_url", "") or "")
                 df.loc[lead_i, "foreclosure_notice_details"] = str(sig.get("signal_details", "") or "")
+                df.loc[lead_i, "foreclosure_mortgage_amount"] = int(sig.get("mortgage_amount", 0) or 0)
                 df.loc[lead_i, "foreclosure_match_method"] = "fuzzy_address"
                 df.loc[lead_i, "foreclosure_fuzzy_score"] = int(score)
 
