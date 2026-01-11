@@ -2,6 +2,7 @@ import os
 import re
 import tempfile
 import urllib.parse
+import hashlib
 from datetime import datetime
 
 import pandas as pd
@@ -36,6 +37,9 @@ default_city_list = [
     "Minnetonka", "Hopkins", "Crystal", "New Hope", "Robbinsdale", "Maple Grove",
 ]
 
+# -------------------------
+# Sidebar
+# -------------------------
 with st.sidebar:
     st.header("Search Filters")
 
@@ -85,9 +89,12 @@ if "probate_crosscheck_filter_results" not in st.session_state:
 if "saved_pids" not in st.session_state:
     st.session_state.saved_pids = set()
 
+# Audit cache:
+# interaction_cache[entity_key] = {"zillow_clicked_at": "...", "county_clicked_at": "...", ...}
 if "interaction_cache" not in st.session_state:
     st.session_state.interaction_cache = {}
 
+# JS open queue
 if "js_open_url" not in st.session_state:
     st.session_state.js_open_url = ""
 if "js_open_nonce" not in st.session_state:
@@ -101,24 +108,89 @@ def now_ts() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def log_interaction(pid_raw: str, field: str):
-    pid_raw = digits_only(pid_raw)
-    if not pid_raw:
+def stable_key_for_row(row: pd.Series) -> str:
+    """
+    Prefer PID-based key. If PID is absent (notice-only rows), use a stable hash of source URLs + address text.
+    This keeps audit tracking working for non-PID sources too.
+    """
+    pid_raw = digits_only(str(row.get("pid_raw", "")).strip())
+    if pid_raw:
+        return f"pid:{pid_raw}"
+
+    # notice-only fallback
+    addr = str(row.get("situs_address", "")).strip().upper()
+    fc = str(row.get("foreclosure_notice_url", "")).strip()
+    pb = str(row.get("probate_notice_url", "")).strip()
+    src = fc or pb or str(row.get("source_url", "")).strip()
+    raw = (src + "|" + addr)[:500]
+    h = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    return f"notice:{h}"
+
+
+def log_interaction(entity_key: str, field: str):
+    if not entity_key:
         return
     cache = st.session_state.interaction_cache
-    if pid_raw not in cache:
-        cache[pid_raw] = {}
-    cache[pid_raw][field] = now_ts()
+    if entity_key not in cache:
+        cache[entity_key] = {}
+    cache[entity_key][field] = now_ts()
 
 
-def get_interaction(pid_raw: str, field: str) -> str:
-    pid_raw = digits_only(pid_raw)
-    return (st.session_state.interaction_cache.get(pid_raw, {}) or {}).get(field, "")
+def get_interaction(entity_key: str, field: str) -> str:
+    return (st.session_state.interaction_cache.get(entity_key, {}) or {}).get(field, "")
 
 
 def zillow_search_url(address: str, city: str, state: str, zipc: str) -> str:
     q = f"{address}, {city}, {state} {zipc}".strip().strip(",")
     return f"https://www.zillow.com/homes/{urllib.parse.quote_plus(q)}_rb/"
+
+
+def _queue_js_open(url: str):
+    if not url:
+        return
+    st.session_state.js_open_url = url
+    st.session_state.js_open_nonce += 1
+
+
+def _flush_js_open():
+    url = st.session_state.get("js_open_url", "")
+    nonce = st.session_state.get("js_open_nonce", 0)
+    if not url:
+        return
+    components.html(
+        f"""
+        <script>
+          (function() {{
+            const url = {url!r};
+            window.open(url, "_blank", "noopener,noreferrer");
+          }})();
+        </script>
+        <div style="display:none">nonce:{nonce}</div>
+        """,
+        height=0,
+    )
+    st.session_state.js_open_url = ""
+
+
+def open_url_icon_button(
+    *,
+    icon: str,
+    help_text: str,
+    url: str,
+    entity_key: str,
+    audit_field: str,
+    key: str,
+):
+    """
+    Clickable icon that:
+      - logs audit
+      - opens url in new tab
+      - keeps user on page
+    """
+    if st.button(icon, key=key, help=help_text):
+        log_interaction(entity_key, audit_field)
+        _queue_js_open(url)
+        st.rerun()
 
 
 def _enforce_pid_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -179,7 +251,7 @@ def _header_nav():
             st.query_params["view"] = "saved"
             st.rerun()
     with right:
-        st.caption("Foreclosure merge uses PID → exact addr → fuzzy addr. Fuzzy matches show 🧩 badge.")
+        st.caption("Audit tracking logs timestamps for each icon click, even for notice-only rows.")
 
 
 def _save_toggle(pid_raw: str) -> bool:
@@ -188,37 +260,12 @@ def _save_toggle(pid_raw: str) -> bool:
         return False
     if pid_raw in st.session_state.saved_pids:
         st.session_state.saved_pids.remove(pid_raw)
-        log_interaction(pid_raw, "unsaved_at")
+        log_interaction(f"pid:{pid_raw}", "unsaved_at")
         return False
     else:
         st.session_state.saved_pids.add(pid_raw)
-        log_interaction(pid_raw, "saved_at")
+        log_interaction(f"pid:{pid_raw}", "saved_at")
         return True
-
-
-def _queue_js_open(url: str):
-    st.session_state.js_open_url = url
-    st.session_state.js_open_nonce += 1
-
-
-def _flush_js_open():
-    url = st.session_state.get("js_open_url", "")
-    nonce = st.session_state.get("js_open_nonce", 0)
-    if not url:
-        return
-    components.html(
-        f"""
-        <script>
-          (function() {{
-            const url = {url!r};
-            window.open(url, "_blank", "noopener,noreferrer");
-          }})();
-        </script>
-        <div style="display:none">nonce:{nonce}</div>
-        """,
-        height=0,
-    )
-    st.session_state.js_open_url = ""
 
 
 def _compute_source_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -273,6 +320,13 @@ def _render_source_badges(sources: list[str]):
 
 
 def _filter_by_selected_extra_distress_signals_OR(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    OR logic:
+      - if foreclosure selected -> keep foreclosure rows
+      - if probate selected -> keep probate rows
+      - if both selected -> keep (foreclosure OR probate)
+      - if neither selected -> no restriction
+    """
     if df is None or df.empty:
         return df
 
@@ -368,91 +422,6 @@ def _make_notice_only_rows(forecl_df: pd.DataFrame, probate_df: pd.DataFrame) ->
     return pd.DataFrame(rows)
 
 
-def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True):
-    pid_raw = digits_only(str(row.get("pid_raw", "")).strip())
-    pid_fmt = format_pid(pid_raw) if pid_raw else "—"
-
-    addr = str(row.get("situs_address", "")).strip()
-    city = str(row.get("situs_city", "")).strip()
-    zipc = str(row.get("situs_zip", "")).strip()
-    owner = str(row.get("owner_name", "")).strip()
-    score = row.get("score", "")
-    notes = str(row.get("score_notes", ""))
-    ptype = str(row.get("property_type", "")).strip()
-
-    is_notice_only = bool(row.get("is_notice_only", False))
-    county_url = hennepin_pins_pid_url(pid_raw) if pid_raw else ""
-
-    z_url = zillow_search_url(addr, city, "MN", zipc) if addr and city else ""
-
-    sources = row.get("sources_found", [])
-    if isinstance(sources, str):
-        sources = [s.strip() for s in sources.split("|") if s.strip()]
-
-    fc_url = str(row.get("foreclosure_notice_url", "")).strip()
-    pb_url = str(row.get("probate_notice_url", "")).strip()
-
-    fmm = str(row.get("foreclosure_match_method", "")).strip()
-    fscore = row.get("foreclosure_fuzzy_score", 0)
-
-    with st.container(border=True):
-        c1, c2, c3, c4, c5, c6 = st.columns([6, 2, 1, 1, 1, 1])
-
-        with c1:
-            st.markdown(f"### {addr or '—'}")
-            st.write(f"**City:** {city or '—'}  •  **ZIP:** {zipc or '—'}")
-            st.write(f"**PID:** {pid_fmt}  •  **Type:** {ptype or '—'}  •  **Owner/Decedent:** {owner or '—'}")
-            _render_source_badges(sources)
-
-            if fmm.lower() == "fuzzy_address":
-                try:
-                    st.caption(f"🧩 Fuzzy address match score: **{int(fscore)}**")
-                except Exception:
-                    pass
-
-            st.write(f"**Score:** {score}  •  {notes}")
-
-            link_row = []
-            if fc_url:
-                link_row.append(("Foreclosure source", fc_url))
-            if pb_url:
-                link_row.append(("Probate source", pb_url))
-            if link_row:
-                st.caption(" • ".join([f"[{t}]({u})" for t, u in link_row]))
-
-        with c2:
-            st.write(f"**Market Value:** {row.get('market_value_total', '')}")
-            st.write(f"**Last Sale:** {row.get('sale_date_raw', '')}")
-            st.write(f"**Sale Price:** {row.get('sale_price', '')}")
-
-        with c3:
-            if county_url:
-                st.link_button("🏛️", county_url, help="Open Hennepin County property search (PID)")
-            else:
-                st.caption("—")
-
-        with c4:
-            if z_url:
-                if st.button("🔎", key=f"z_{idx_key}", help="Open Zillow (new tab)"):
-                    _queue_js_open(z_url)
-                    st.rerun()
-            else:
-                st.caption("—")
-
-        with c5:
-            if (not is_notice_only) and pid_raw:
-                if st.button("📊", key=f"c_{idx_key}", help="Open comparable analysis"):
-                    st.query_params.clear()
-                    st.query_params["view"] = "comps"
-                    st.query_params["pid"] = pid_raw
-                    st.rerun()
-            else:
-                st.caption("—")
-
-        with c6:
-            st.caption("—")
-
-
 def _apply_notice_sources_and_union(base_df: pd.DataFrame):
     cfg = NoticeConfig(limit=notice_limit, max_age_days=notice_age, sleep_s=0.2)
 
@@ -473,7 +442,7 @@ def _apply_notice_sources_and_union(base_df: pd.DataFrame):
 
     enriched = base_df
     if base_df is not None and not base_df.empty and ((not forecl_df.empty) or (not probate_df.empty)):
-        # ✅ Backwards-compatible call (fixes your TypeError)
+        # Backwards-compatible call
         try:
             enriched = merge_notices_into_leads(
                 base_df,
@@ -503,6 +472,7 @@ def _apply_notice_sources_and_union(base_df: pd.DataFrame):
         ("probate_notice_url", ""),
         ("foreclosure_match_method", ""),
         ("foreclosure_fuzzy_score", 0),
+        ("sources_found", []),
     ]:
         if col not in combined.columns:
             combined[col] = default
@@ -510,9 +480,130 @@ def _apply_notice_sources_and_union(base_df: pd.DataFrame):
     return combined
 
 
+def _render_property_card(row: pd.Series, idx_key: str, allow_save: bool = True):
+    pid_raw = digits_only(str(row.get("pid_raw", "")).strip())
+    pid_fmt = format_pid(pid_raw) if pid_raw else "—"
+    is_notice_only = bool(row.get("is_notice_only", False))
+
+    addr = str(row.get("situs_address", "")).strip()
+    city = str(row.get("situs_city", "")).strip()
+    zipc = str(row.get("situs_zip", "")).strip()
+    owner = str(row.get("owner_name", "")).strip()
+    score = row.get("score", "")
+    notes = str(row.get("score_notes", ""))
+    ptype = str(row.get("property_type", "")).strip()
+
+    sources = row.get("sources_found", [])
+    if isinstance(sources, str):
+        sources = [s.strip() for s in sources.split("|") if s.strip()]
+
+    # entity key used for audit (PID-based or notice-hash)
+    entity_key = stable_key_for_row(row)
+
+    # URLs
+    county_url = hennepin_pins_pid_url(pid_raw) if pid_raw else ""
+    z_url = zillow_search_url(addr, city, "MN", zipc) if addr and city else ""
+
+    fc_url = str(row.get("foreclosure_notice_url", "")).strip()
+    pb_url = str(row.get("probate_notice_url", "")).strip()
+
+    # audits
+    z_clicked = get_interaction(entity_key, "zillow_clicked_at")
+    c_clicked = get_interaction(entity_key, "county_clicked_at")
+    comps_opened = get_interaction(entity_key, "comps_opened_at")
+    saved_at = get_interaction(entity_key, "saved_at")
+
+    is_saved = (pid_raw in st.session_state.saved_pids) if pid_raw else False
+
+    with st.container(border=True):
+        c1, c2, c3, c4, c5, c6 = st.columns([6, 2, 1, 1, 1, 1])
+
+        with c1:
+            st.markdown(f"### {addr or '—'}")
+            st.write(f"**City:** {city or '—'}  •  **ZIP:** {zipc or '—'}")
+            st.write(f"**PID:** {pid_fmt}  •  **Type:** {ptype or '—'}  •  **Owner/Decedent:** {owner or '—'}")
+            _render_source_badges(sources)
+            st.write(f"**Score:** {score}  •  {notes}")
+
+            # Source detail links (these are not audited unless we also add icon-buttons; keeping as reference)
+            ref_links = []
+            if fc_url:
+                ref_links.append(("Foreclosure source", fc_url))
+            if pb_url:
+                ref_links.append(("Probate source", pb_url))
+            if ref_links:
+                st.caption(" • ".join([f"[{t}]({u})" for t, u in ref_links]))
+
+            meta = []
+            if c_clicked:
+                meta.append(f"🏛️ County clicked: {c_clicked}")
+            if z_clicked:
+                meta.append(f"🔎 Zillow clicked: {z_clicked}")
+            if comps_opened:
+                meta.append(f"📊 Comps opened: {comps_opened}")
+            if saved_at:
+                meta.append(f"⭐ Saved: {saved_at}")
+            if meta:
+                st.caption(" | ".join(meta))
+
+        with c2:
+            st.write(f"**Market Value:** {row.get('market_value_total', '')}")
+            st.write(f"**Last Sale:** {row.get('sale_date_raw', '')}")
+            st.write(f"**Sale Price:** {row.get('sale_price', '')}")
+
+        # Icons (AUDITED)
+        with c3:
+            if county_url:
+                open_url_icon_button(
+                    icon="🏛️",
+                    help_text="Open Hennepin County property page (audited)",
+                    url=county_url,
+                    entity_key=entity_key,
+                    audit_field="county_clicked_at",
+                    key=f"county_{idx_key}",
+                )
+            else:
+                st.caption("—")
+
+        with c4:
+            if z_url:
+                open_url_icon_button(
+                    icon="🔎",
+                    help_text="Open Zillow (audited)",
+                    url=z_url,
+                    entity_key=entity_key,
+                    audit_field="zillow_clicked_at",
+                    key=f"z_{idx_key}",
+                )
+            else:
+                st.caption("—")
+
+        with c5:
+            # comps (internal page) – audited
+            if (not is_notice_only) and pid_raw:
+                if st.button("📊", key=f"c_{idx_key}", help="Open comparable analysis (audited)"):
+                    log_interaction(entity_key, "comps_opened_at")
+                    st.query_params.clear()
+                    st.query_params["view"] = "comps"
+                    st.query_params["pid"] = pid_raw
+                    st.rerun()
+            else:
+                st.caption("—")
+
+        with c6:
+            if allow_save and pid_raw:
+                label = "★" if is_saved else "☆"
+                help_txt = "Unsave" if is_saved else "Save to list"
+                if st.button(label, key=f"s_{idx_key}", help=help_txt):
+                    _save_toggle(pid_raw)
+                    st.rerun()
+            else:
+                st.caption("—")
+
+
 def render_results():
     st.title("Wholesale Property Finder — Hennepin + Star Tribune Signals")
-    st.caption("Foreclosure matching: PID → exact addr → fuzzy addr (when PID missing).")
+    st.caption("Audit tracking logs timestamps for icon clicks (County, Zillow, Comps).")
 
     _header_nav()
     _flush_js_open()
@@ -520,6 +611,10 @@ def render_results():
     run_btn = st.button("Run crawler", type="primary")
 
     if run_btn:
+        def log(msg: str):
+            if show_debug:
+                st.write(msg)
+
         with st.spinner("Running Hennepin crawl…"):
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
             tmp.close()
@@ -531,7 +626,7 @@ def render_results():
                     property_types=None,
                     top_n=top_n,
                     out_csv=tmp.name,
-                    logger=(lambda m: st.write(m)) if show_debug else None,
+                    logger=log,
                 )
                 base_df = pd.read_csv(tmp.name, dtype={"pid": "string", "pid_raw": "string"}, keep_default_na=False)
             finally:
@@ -544,9 +639,13 @@ def render_results():
 
         combined = _apply_notice_sources_and_union(base_df)
         combined = _compute_source_indicators(combined)
+
+        # Distress filters (OR)
         combined = _filter_by_selected_extra_distress_signals_OR(combined)
 
         st.session_state.results_df = combined
+        st.session_state.property_type_filter_results = []
+        st.session_state.probate_crosscheck_filter_results = []
 
     df = st.session_state.results_df
     if df is None:
@@ -556,20 +655,100 @@ def render_results():
         st.warning("No results returned with the current selections.")
         return
 
+    # Post-search filters
+    st.markdown("## Post-search Filters")
+
+    pt_options = _property_type_options(df)
+    if pt_options:
+        st.session_state.property_type_filter_results = [
+            x for x in st.session_state.property_type_filter_results if x in pt_options
+        ]
+        st.session_state.property_type_filter_results = st.multiselect(
+            "Property type (values from this search only)",
+            options=pt_options,
+            default=st.session_state.property_type_filter_results,
+        )
+
+    pcs_options = _probate_crosscheck_options(df)
+    if pcs_options:
+        st.session_state.probate_crosscheck_filter_results = [
+            x for x in st.session_state.probate_crosscheck_filter_results if x in pcs_options
+        ]
+        st.session_state.probate_crosscheck_filter_results = st.multiselect(
+            "Probate cross-check status (values from this search only)",
+            options=pcs_options,
+            default=st.session_state.probate_crosscheck_filter_results,
+        )
+
+    df_ui = df
+    df_ui = _apply_property_type_filter(df_ui, st.session_state.property_type_filter_results)
+    df_ui = _apply_probate_crosscheck_filter(df_ui, st.session_state.probate_crosscheck_filter_results)
+
     st.divider()
+
+    st.download_button(
+        "Download CSV (filtered)",
+        df_ui.to_csv(index=False).encode("utf-8"),
+        "ranked_leads_filtered.csv",
+        "text/csv",
+    )
+
     st.subheader("Results")
 
-    total = len(df)
+    total = len(df_ui)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
     start = (page - 1) * page_size
     end = min(total, start + page_size)
+    slice_df = df_ui.iloc[start:end].copy()
 
-    slice_df = df.iloc[start:end].copy()
     st.caption(f"Showing rows {start+1:,}–{end:,} of {total:,}")
 
     for i, row in slice_df.iterrows():
         _render_property_card(row, idx_key=f"r_{i}", allow_save=True)
+
+
+def render_saved():
+    st.title("⭐ Saved Properties")
+    _header_nav()
+    _flush_js_open()
+
+    saved = sorted(st.session_state.saved_pids)
+    if not saved:
+        st.info("Your saved list is empty. Go to Results and click ☆ to save properties.")
+        return
+
+    df = st.session_state.results_df
+    if df is None or df.empty:
+        st.warning("No results are loaded yet. Run the crawler first.")
+        st.write(saved)
+        return
+
+    df_saved = df[df.get("pid_raw", "").astype(str).map(digits_only).isin(saved)].copy()
+    if df_saved.empty:
+        st.warning("None of your saved PIDs are in the currently loaded results.")
+        return
+
+    st.download_button(
+        "Download CSV (saved)",
+        df_saved.to_csv(index=False).encode("utf-8"),
+        "saved_properties.csv",
+        "text/csv",
+    )
+
+    st.subheader(f"Saved ({len(df_saved):,})")
+
+    total = len(df_saved)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = st.number_input("Page (Saved)", min_value=1, max_value=total_pages, value=1, step=1)
+    start = (page - 1) * page_size
+    end = min(total, start + page_size)
+    slice_df = df_saved.iloc[start:end].copy()
+
+    st.caption(f"Showing rows {start+1:,}–{end:,} of {total:,}")
+
+    for i, row in slice_df.iterrows():
+        _render_property_card(row, idx_key=f"sv_{i}", allow_save=True)
 
 
 def render_comps(pid_any: str):
@@ -578,19 +757,32 @@ def render_comps(pid_any: str):
 
     st.title("Comparable Analysis (County + Zillow link)")
     _header_nav()
+    _flush_js_open()
 
-    colA, colB, _ = st.columns([2, 2, 8])
+    if not pid_raw:
+        st.warning("No PID provided. Go back to Results and click 📊 on a county property.")
+        return
+
+    entity_key = f"pid:{pid_raw}"
+
+    colA, colB, colC = st.columns([2, 2, 8])
     with colA:
-        st.link_button("🏛️ County Property Page", hennepin_pins_pid_url(pid_raw))
+        # audited open
+        open_url_icon_button(
+            icon="🏛️",
+            help_text="Open Hennepin County property page (audited)",
+            url=hennepin_pins_pid_url(pid_raw),
+            entity_key=entity_key,
+            audit_field="county_clicked_at",
+            key=f"comps_county_{pid_raw}",
+        )
     with colB:
         if st.button("⬅️ Back to Results"):
             st.query_params.clear()
             st.query_params["view"] = "results"
             st.rerun()
-
-    if not pid_raw:
-        st.warning("No PID provided. Go back to Results and click 📊 on a county property.")
-        return
+    with colC:
+        st.caption(f"PID: {pid_fmt}")
 
     with st.spinner("Loading county parcel…"):
         subj = get_parcel_by_pid(pid_raw)
@@ -605,15 +797,35 @@ def render_comps(pid_any: str):
     z_url = zillow_search_url(addr, city, "MN", zipc)
 
     st.subheader(f"{addr}, {city} {zipc}")
-    st.write(f"**PID:** {pid_fmt}")
-    if st.button("🔎 Open Zillow (new tab)"):
-        _queue_js_open(z_url)
-        st.rerun()
+
+    # audited Zillow open
+    open_url_icon_button(
+        icon="🔎 Open Zillow",
+        help_text="Open Zillow (audited)",
+        url=z_url,
+        entity_key=entity_key,
+        audit_field="zillow_clicked_at",
+        key=f"comps_z_{pid_raw}",
+    )
 
     st.divider()
     st.subheader("Nearby County Comps")
+
+    c1, c2, c3, _ = st.columns([2, 2, 2, 4])
+    with c1:
+        radius_m = st.slider("Radius (meters)", 200, 2000, 800, 100)
+    with c2:
+        max_comps = st.slider("Max comps", 5, 50, 15, 1)
+    with c3:
+        value_band = st.slider("County value band (+/- %)", 10, 80, 30, 5)
+
     with st.spinner("Finding county comps…"):
-        comps_df = get_comps_for_pid(pid_any=pid_raw, radius_m=800, max_comps=15, value_band_pct=30)
+        comps_df = get_comps_for_pid(
+            pid_any=pid_raw,
+            radius_m=radius_m,
+            max_comps=max_comps,
+            value_band_pct=value_band,
+        )
 
     if comps_df is None or comps_df.empty:
         st.warning("No county comps found with current filters.")
@@ -622,7 +834,12 @@ def render_comps(pid_any: str):
     st.dataframe(comps_df, use_container_width=True)
 
 
-if view == "comps":
+# -------------------------
+# Router
+# -------------------------
+if view == "saved":
+    render_saved()
+elif view == "comps":
     render_comps(pid_qp)
 else:
     render_results()
